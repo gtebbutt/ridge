@@ -187,7 +187,7 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
 
         if use_sincos_pos_embed:
             # Assumes the default sample size is 512x512px with an 8x VAE reduction (i.e. 64x64 latents)
-            interpolation_scale = self.config.sample_size // 64
+            interpolation_scale = sample_size // 64
             interpolation_scale = max(interpolation_scale, 1)
 
             self.pos_embed = PositionEmbed(
@@ -279,6 +279,7 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
         encoder_attention_mask: Optional[torch.Tensor] = None,
         return_dict: bool = True,
         sincos_pos_embed_strength: float = 1.0,
+        enable_padding: bool = False,
     ):
         batch_size = hidden_states.shape[0]
 
@@ -300,7 +301,7 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
 
         pad_length = None
 
-        if input_sequence_length < self.sequence_length:
+        if enable_padding and input_sequence_length < self.sequence_length:
             # Channel count at this point is set by the conv2d projection in the patch embedding, will be 1152 for standard DiT and Pixart models
             assert hidden_states.shape[0] == batch_size and hidden_states.shape[1] == input_sequence_length and hidden_states.shape[2] == self.num_attention_heads * self.attention_head_dim, f"Unexpected latent shape: expected flattened {self.num_attention_heads * self.attention_head_dim} channel (b n c) tensor, but got shape {hidden_states.shape}"
 
