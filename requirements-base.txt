@@ -1,0 +1,16 @@
+# Direct dependencies here, to make it easier to keep track of things and manually update them without causing conflicts. Full dependencies are then stored in the normal requirements.txt for repeatable installation
+# You probably want to use requirements.txt unless you're actively trying to fix an installation issue
+
+accelerate~=0.28.0
+beautifulsoup4~=4.12.3
+diffusers~=0.27.0
+einops~=0.7.0
+ftfy~=6.2.0
+peft~=0.9.0
+torch==2.2.1
+torchaudio
+torchvision
+torch-tensorrt
+transformers~=4.38.2
+transformers[sentencepiece]
+webdataset~=0.2.86
