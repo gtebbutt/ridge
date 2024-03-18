@@ -6,6 +6,7 @@ from typing import List, Dict, Tuple, Callable, Optional, Union, Any
 import torch
 from torch import nn
 import torch.nn.functional as F
+from einops import rearrange
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
@@ -85,8 +86,7 @@ class DiffusionTransformerBlock(nn.Module):
         timestep: Optional[torch.LongTensor] = None,
         cross_attention_kwargs: Dict[str, Any] = None,
         class_labels: Optional[torch.LongTensor] = None,
-        height_patches: int = None,
-        width_patches: int = None,
+        shapes_patches: Optional[List[Tuple[int, int]]] = None,
     ) -> torch.FloatTensor:
         batch_size = hidden_states.shape[0]
 
@@ -113,8 +113,7 @@ class DiffusionTransformerBlock(nn.Module):
             norm_hidden_states,
             encoder_hidden_states=None,
             attention_mask=attention_mask,
-            height_patches=height_patches,
-            width_patches=width_patches,
+            shapes_patches=shapes_patches,
             **cross_attention_kwargs,
         )
 
@@ -129,8 +128,7 @@ class DiffusionTransformerBlock(nn.Module):
                 hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 attention_mask=encoder_attention_mask,
-                height_patches=height_patches,
-                width_patches=width_patches,
+                shapes_patches=shapes_patches,
                 **cross_attention_kwargs,
             )
             hidden_states = attn_output + hidden_states
@@ -179,7 +177,7 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
 
         # Note that these dimensions are in latent space, so will be 8x smaller than pixel values (assuming default VAE scale factor)
         # Currently assumes square patches in two dimensions, but can easily be extended
-        self.sequence_length = (sample_size * sample_size) // (self.patch_size * self.patch_size)
+        max_trained_sequence_length = (sample_size ** 2) // (self.patch_size ** 2)
 
         # This just does the patching, rather than treating patching and position embedding as a single operation
         self.patch_embed = PatchEmbed(
@@ -217,7 +215,7 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
                     norm_elementwise_affine=norm_elementwise_affine,
                     norm_eps=norm_eps,
                     use_rotary_pos_embed=use_rotary_pos_embed,
-                    max_trained_sequence_length=self.sequence_length,
+                    max_trained_sequence_length=max_trained_sequence_length,
                 )
                 for d in range(num_layers)
             ]
@@ -271,6 +269,84 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
                 if "adaln_single" in k:
                     update_key("adaln_single", "adaln_embed")
 
+    # The Conv2d used by patch_embed to downsample each patch to a single float has learnable parameters, and the padding needs to be done before the data reaches the model otherwise it can't be batched into a single tensor (as required for autograd to work properly)
+    # Since the Conv2d call treats each patch as independent and non-overlapping, and then the rest of the model expects a flattened sequence anyway, it's functionally identical whether the input is passed in its original ratio or rearranged into a single column of blocks with height h*p and width p
+    def flatten_and_pad(
+        self,
+        *,
+        batch: List[torch.Tensor],
+        attention_masks: Optional[List[Optional[torch.Tensor]]] = None,
+        target_sequence_length_patches: Optional[int] = None,
+    ):
+        if attention_masks is None: 
+            attention_masks = [None] * len(batch)
+
+        if len(attention_masks) != len(batch):
+            raise ValueError(f"Expected one attention mask per item, but got {len(attention_masks)} for batch size {len(batch)}")
+
+        # Important that shapes are captured before flattening, so that the positional embedding for non-square input doesn't get thrown off
+        # Don't forget that dimensions are in latent space, not pixel space
+        shapes_patches = []
+        for item in batch:
+            # Expect each item to have a batch dimension, so that embedding functions don't need to worry about whether they're getting batched or unbatched input, but ensure it's still only a single item
+            if item.ndim != 4 or item.shape[0] != 1 or item.shape[1] != self.config.in_channels:
+                raise ValueError(f"Expected input shape (1 {self.config.in_channels} h w) but got {item.shape}")
+            shapes_patches.append((item.shape[-2] // self.patch_size, item.shape[-1] // self.patch_size))
+
+        if target_sequence_length_patches is None:
+            target_sequence_length_patches = max([h * w for h, w in shapes_patches])
+
+        for i in range(len(batch)):
+            # Unfolds the h and w dimensions to give a six dimensional tensor of shape (b c h/p p w/p p), and then flattens into a single column of patches to give (b c h*w/p p)
+            batch[i] = batch[i].unfold(2, size=self.patch_size, step=self.patch_size).unfold(3, size=self.patch_size, step=self.patch_size).flatten(start_dim=2, end_dim=4)
+
+            sequence_length_patches = batch[i].shape[-2] // self.patch_size
+
+            if sequence_length_patches > target_sequence_length_patches:
+                raise ValueError(f"Tensor shape {batch[i].shape} will result in a sequence of length {sequence_length_patches}, which is greater than target {target_sequence_length_patches}")
+
+            if attention_masks[i] is None:
+                # Mask is a simple 2D tensor of (b n), i.e. one value per patch in the sequence, no need to worry about channels etc. 
+                attention_masks[i] = torch.ones((1, sequence_length_patches), device=batch[i].device, dtype=batch[i].dtype)
+
+            if attention_masks[i].shape[-1] < target_sequence_length_patches:
+                padding_length = target_sequence_length_patches - attention_masks[i].shape[-1]
+                attention_masks[i] = F.pad(
+                    attention_masks[i],
+                    (0, padding_length),
+                    mode="constant",
+                    value=0,
+                )
+
+            if sequence_length_patches < target_sequence_length_patches:
+                padding_length = (target_sequence_length_patches * self.patch_size) - (sequence_length_patches * self.patch_size)
+                batch[i] = F.pad(
+                    batch[i],
+                    # padding_before, padding_after for each dimension, counting from the last
+                    (0, 0, # Width is already exactly p
+                    0, padding_length),
+                    mode="constant",
+                    value=0,
+                )
+        
+        return torch.cat(batch, dim=0), shapes_patches, torch.cat(attention_masks, dim=0)
+
+    def unpad_and_reshape(
+        self,
+        latents: torch.Tensor,
+        shapes_patches: List[Tuple[int, int]],
+    ):
+        num_channels = latents.shape[1]
+        latents = list(latents.unbind(dim=0))
+        for i in range(len(latents)):
+            height_patches, width_patches = shapes_patches[i]
+            sequence_length = height_patches * width_patches * self.patch_size
+            latents[i] = latents[i][:, :sequence_length]
+            latents[i] = latents[i].unfold(1, size=self.patch_size, step=self.patch_size)
+            latents[i] = rearrange(latents[i], "c (h w) pw ph -> c (h ph) (w pw)", c=num_channels, h=height_patches)
+
+        return latents
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -281,60 +357,30 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
         cross_attention_kwargs: Dict[str, Any] = None,
         attention_mask: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
-        return_dict: bool = True,
         absolute_pos_embed_strength: float = 1.0,
-        enable_padding: bool = False,
+        # (h w) shape, in patches, for each item in the batch - important to know if they've been padded, and/or to properly encode positions of images that are the same total number of patches but a different aspect ratio
+        shapes_patches: List[Tuple[int, int]] = None,
+        return_dict: bool = True,
     ):
         batch_size = hidden_states.shape[0]
 
-        # Important that these are captured before padding, so that the positional embedding for non-square input doesn't get thrown off
-        # Don't forget that dimensions are in latent space, not pixel space
-        height_patches, width_patches = hidden_states.shape[-2] // self.patch_size, hidden_states.shape[-1] // self.patch_size
-        input_sequence_length = height_patches * width_patches
+        # These will generally not be the actual image dimensions, assuming flatten_and_pad was called, but it's important to store whatever dimensions the tensor started with before patchifying so it can be recovered correctly at the other end
+        output_width = hidden_states.shape[-1]
+        output_height = hidden_states.shape[-2]
 
-        # Flatten into a linear sequence of patches before padding, so that we don't have to worry about keeping track of axes
+        # Compress each patch into a single float and flatten into a linear sequence
         hidden_states = self.patch_embed(hidden_states) # (b n c)
 
+
         if self.pos_embed is not None:
-            hidden_states = self.pos_embed(
-                hidden_states,
-                height=height_patches,
-                width=width_patches,
-                strength=absolute_pos_embed_strength,
-            )
-
-        pad_length = None
-
-        if enable_padding and input_sequence_length < self.sequence_length:
-            # Channel count at this point is set by the conv2d projection in the patch embedding, will be 1152 for standard DiT and Pixart models
-            assert hidden_states.shape[0] == batch_size and hidden_states.shape[1] == input_sequence_length and hidden_states.shape[2] == self.num_attention_heads * self.attention_head_dim, f"Unexpected latent shape: expected flattened {self.num_attention_heads * self.attention_head_dim} channel (b n c) tensor, but got shape {hidden_states.shape}"
-
-            # Mask is a simple 2D tensor of (b n), i.e. one value per patch in the sequence, no need to worry about channels etc. 
-            attention_mask = torch.ones(hidden_states.shape[:2], device=hidden_states.device, dtype=hidden_states.dtype)
-
-            pad_length = self.sequence_length - input_sequence_length
-
-            hidden_states = F.pad(
-                hidden_states.transpose(1, 2),
-                # Tuple of value pairs for left and right padding on each dimension, starting from the last
-                (0, pad_length),
-                mode="constant",
-                value=0,
-            ).transpose(1, 2)
-
-            attention_mask = F.pad(
-                attention_mask,
-                (0, pad_length),
-                mode="constant",
-                value=0,
-            )
+            hidden_states = self.pos_embed(hidden_states, shapes_patches, absolute_pos_embed_strength)
 
         if attention_mask is not None and attention_mask.ndim == 2:
             # Converts a bitmask to a usable bias that can be added directly to the attention scores
             attention_mask = (1 - attention_mask.to(hidden_states.dtype)) * -10000.0
             attention_mask = attention_mask.unsqueeze(1)
 
-        # This will use the text encoder sequence length (if applicable), so doesn't need padding to self.sequence_length
+        # This will use the text encoder sequence length (if applicable), so doesn't need padding to input_sequence_length
         if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
             encoder_attention_mask = (1 - encoder_attention_mask.to(hidden_states.dtype)) * -10000.0
             encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
@@ -382,8 +428,7 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
                     timestep=timestep,
                     cross_attention_kwargs=cross_attention_kwargs,
                     class_labels=class_labels,
-                    height_patches=height_patches,
-                    width_patches=width_patches,
+                    shapes_patches=shapes_patches,
                 )
 
         if self.adaln_embed is None:
@@ -398,21 +443,17 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
         hidden_states = self.proj_out(hidden_states)
         hidden_states = hidden_states.squeeze(1)
 
-        # Drop padding if used, otherwise height_patches and width_patches won't match the sequence length
-        if pad_length is not None:
-            hidden_states = hidden_states[:, :input_sequence_length]
-
         # Unpatchify
         hidden_states = hidden_states.reshape(
-            shape=(-1, height_patches, width_patches, self.patch_size, self.patch_size, self.out_channels)
+            shape=(-1, output_height // self.patch_size, output_width // self.patch_size, self.patch_size, self.patch_size, self.out_channels)
         )
         hidden_states = torch.einsum("nhwpqc->nchpwq", hidden_states)
-        output = hidden_states.reshape(
-            shape=(-1, self.out_channels, height_patches * self.patch_size, width_patches * self.patch_size)
+        hidden_states = hidden_states.reshape(
+            shape=(-1, self.out_channels, output_height, output_width)
         )
 
         if return_dict:
             # Some diffusers pipelines are hardcoded to expect a .sample parameter on the return value, and SimpleNamespace is the easiest way to return an object with dot notation access (rather than dict-style square bracket notation)
-            return SimpleNamespace(sample=output)
+            return SimpleNamespace(sample=hidden_states)
         else:
-            return (output,)
+            return (hidden_states,)

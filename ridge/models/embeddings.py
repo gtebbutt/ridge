@@ -62,14 +62,18 @@ class PositionEmbed(nn.Module):
     def forward(
         self,
         latent: torch.Tensor,
-        # Important to pass height and width explicitly, unlike the diffusers version, because the input has already been flattened to a sequence here
-        height: int,
-        width: int,
-        strength: float = 1.0
+        # Important to pass shapes explicitly, unlike the diffusers version, because the input has already been flattened to a sequence here
+        shapes: List[List[int]],
+        strength: float = 1.0,
     ):
         if not (0.0 <= strength <= 1.0):
             raise ValueError(f"Invalid PositionEmbed strength {strength}, values must be between 0 and 1")
-        
+
+        if len(set(shapes)) != 1:
+            raise NotImplementedError(f"Heterogeneous batches are not yet supported")
+        else:
+            height, width = shapes[0]
+
         if strength == 0:
             return latent
 
@@ -165,9 +169,14 @@ class MultiAxisRotaryPositionEmbed(nn.Module):
         self,
         query: torch.Tensor,
         key: torch.Tensor,
-        shape: List[int],
+        shapes: List[List[int]],
         interpolation_type: Optional[str] = None,
     ):
+        if len(set(shapes)) != 1:
+            raise NotImplementedError(f"Heterogeneous batches are not yet supported")
+        else:
+            shape = shapes[0]
+
         # Query and key shape are both (b n h d) where h is num_attention_heads and d is attention_head_dim (which should be equal to embed_dim); for DiT and Pixart models num_attention_heads=16 and attention_head_dim=72
         batch_size = query.shape[0]
         sequence_length = query.shape[1]
