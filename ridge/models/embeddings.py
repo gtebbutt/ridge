@@ -42,6 +42,7 @@ class PositionEmbed(nn.Module):
         width: int,
         patch_size: int,
         embed_dim: int,
+        # This is equivalent to training_interpolation_scale in MultiAxisRotaryPositionEmbed, naming here is just kept to match the original version
         interpolation_scale: float = 1.0,
     ):
         super().__init__()
@@ -107,6 +108,8 @@ class MultiAxisRotaryPositionEmbed(nn.Module):
         *,
         embed_dim: int,
         axes: int = 2,
+        max_trained_sequence_length: int,
+        training_interpolation_scale: float = 1.0,
         theta: float = 10000.0,
     ):
         super().__init__()
@@ -116,20 +119,43 @@ class MultiAxisRotaryPositionEmbed(nn.Module):
         self.axes = axes
         self.theta = theta
 
+        # The different types of scaling and when they get applied can sometimes be confusing; this one is a training-time variable used to more quickly fine tune and existing model to a larger (or smaller) target sequence length by mapping new positions into the range that the model already understands
+        # Good visualisation and writeup at https://blog.eleuther.ai/yarn/#position-interpolation
+        self.training_interpolation_scale = training_interpolation_scale
+
+        # This is used to scale inference-time interpolation if applicable, and is independent of training_interpolation_scale. At training time it should be set to the maximum sequence length in the new training dataset, even if fine tuning from an existing checkpoint with a shorter trained sequence length
+        self.max_trained_sequence_length = max_trained_sequence_length
+
     # Linear implementations generally cache this in a buffer, but doing so for more axes triggers torch recompilation every time the shape changes, and adds potentially significant memory overhead unless you know up front you're only using a single aspect ratio
-    def calculate_freqs(self, shape: List[int]):
+    def calculate_freqs(
+        self,
+        shape: List[int],
+        interpolation_type: Optional[str] = None,
+    ):
         if not len(shape) == self.axes:
             raise ValueError(f"Expected a {self.axes}-axis shape, but got {shape}")
 
+        input_sequence_length = reduce(lambda a, b: a * b, shape)
+
+        if interpolation_type is None or input_sequence_length <= self.max_trained_sequence_length:
+            theta = self.theta
+        elif interpolation_type == "dynamic-ntk":
+            # This currently assumes uniform scaling across all axes, which gives greater overall flexibility and works well for real-world image generation use, but it can easily be extended to apply per-axis by tracking the max trained length for each axis rather than for the sequence as a whole and calculating a separate theta value for each; may be useful to do so if extrapolating to aspect ratios significantly beyond those in the training data
+            exponent = (self.embed_dim / (self.embed_dim - 2))
+            theta = self.theta * ((self.training_interpolation_scale * input_sequence_length / self.max_trained_sequence_length) - (self.training_interpolation_scale - 1)) ** exponent
+        else:
+            raise ValueError(f"Invalid interpolation type: {interpolation_type}")
+
         # One tensor for each axis, each containing the cartesian coordinates on that axis for every point in the space; meshgrid returns int64 coordinates by default
         axis_positions = torch.meshgrid([torch.arange(l) for l in shape], indexing="ij")
+        axis_positions = [pos.to(torch.float32) * self.training_interpolation_scale for pos in axis_positions]
 
         # Explicitly using fp32 here, since autocast is disabled in the forward function
         # Factor of two per axis to account for the fact we'll be repeating this for each axis, and then using the overall result twice to get the sin and cos components in the forward function
-        base_freqs = 1.0 / (self.theta ** (torch.arange(0, self.embed_dim, 2 * self.axes).to(dtype=torch.float32) / self.embed_dim))
+        base_freqs = 1.0 / (theta ** (torch.arange(0, self.embed_dim, 2 * self.axes).to(dtype=torch.float32) / self.embed_dim))
 
-        freqs = [torch.outer(pos.flatten().to(torch.float32), base_freqs) for pos in reversed(axis_positions)]
-        
+        freqs = [torch.outer(pos.flatten(), base_freqs) for pos in reversed(axis_positions)]
+
         # Einops accepts a list of tensors and treats it as if the values were already stacked into a single tensor, which makes things easier here
         # Using torch.cat(..., dim=-1) directly would be equivalent to "a n d -> n (a d)", which gives the shape we want but not the correct ordering of elements within the tensor; the alternative is to stack along a new final dimension and then reshape, but rearrange makes things more readable. Ordering matters here because we're emulating the way torch handles complex polar values
         # Returns shape (n, self.embed_dim / 2)
@@ -140,6 +166,7 @@ class MultiAxisRotaryPositionEmbed(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
         shape: List[int],
+        interpolation_type: Optional[str] = None,
     ):
         # Query and key shape are both (b n h d) where h is num_attention_heads and d is attention_head_dim (which should be equal to embed_dim); for DiT and Pixart models num_attention_heads=16 and attention_head_dim=72
         batch_size = query.shape[0]
@@ -148,7 +175,7 @@ class MultiAxisRotaryPositionEmbed(nn.Module):
 
         # Always run these calculations in fp32, even if autocast is enabled - longer sequences get unstable if the sin and cos values are handled in reduced precision
         with torch.cuda.amp.autocast(enabled=False):
-            freqs = self.calculate_freqs(shape) # (n d/2)
+            freqs = self.calculate_freqs(shape, interpolation_type) # (n d/2)
 
             # Equivalent to torch.polar but using the last dimension for (real, imaginary) rather than using complex dtypes, as they aren't compatible with torch.compile
             freqs = torch.stack([freqs.cos(), freqs.sin()], dim=-1)

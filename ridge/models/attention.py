@@ -10,6 +10,7 @@ from .embeddings import MultiAxisRotaryPositionEmbed
 class Attention(nn.Module):
     def __init__(
         self,
+        *,
         query_dim: int,
         cross_attention_dim: Optional[int] = None,
         heads: int = 8,
@@ -19,6 +20,7 @@ class Attention(nn.Module):
         out_bias: bool = True,
         eps: float = 1e-5,
         use_rotary_pos_embed: bool = False,
+        max_trained_sequence_length: Optional[int] = None,
     ):
         super().__init__()
         self.inner_dim = dim_head * heads
@@ -28,7 +30,10 @@ class Attention(nn.Module):
         self.heads = heads
 
         if use_rotary_pos_embed:
-            self.rotary_emb = MultiAxisRotaryPositionEmbed(embed_dim=self.query_dim // self.heads)
+            self.rotary_emb = MultiAxisRotaryPositionEmbed(
+                embed_dim=self.query_dim // self.heads,
+                max_trained_sequence_length=max_trained_sequence_length,
+            )
         else:
             self.rotary_emb = None
 

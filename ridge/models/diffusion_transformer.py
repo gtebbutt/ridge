@@ -31,6 +31,7 @@ class DiffusionTransformerBlock(nn.Module):
         norm_type: str,
         norm_eps: float,
         use_rotary_pos_embed: bool = False,
+        max_trained_sequence_length: Optional[int] = None,
     ):
         super().__init__()
 
@@ -49,6 +50,7 @@ class DiffusionTransformerBlock(nn.Module):
             bias=attention_bias,
             cross_attention_dim=None,
             use_rotary_pos_embed=use_rotary_pos_embed,
+            max_trained_sequence_length=max_trained_sequence_length,
         )
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine, eps=norm_eps)
@@ -61,6 +63,7 @@ class DiffusionTransformerBlock(nn.Module):
                 dim_head=attention_head_dim,
                 bias=attention_bias,
                 use_rotary_pos_embed=use_rotary_pos_embed,
+                max_trained_sequence_length=max_trained_sequence_length,
             )
         else:
             self.attn2 = None
@@ -163,7 +166,7 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
         norm_eps: float = 1e-6,
         caption_channels: int = None,
         # It won't make sense to enable both of these in normal use, but it's important for training to allow one to be phased out in favour of the other over the course of a few thousand steps
-        use_sincos_pos_embed: bool = True,
+        use_absolute_pos_embed: bool = True,
         use_rotary_pos_embed: bool = False,
     ):
         super().__init__()
@@ -185,7 +188,7 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
             embed_dim=inner_dim,
         )
 
-        if use_sincos_pos_embed:
+        if use_absolute_pos_embed:
             # Assumes the default sample size is 512x512px with an 8x VAE reduction (i.e. 64x64 latents)
             interpolation_scale = sample_size // 64
             interpolation_scale = max(interpolation_scale, 1)
@@ -214,6 +217,7 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
                     norm_elementwise_affine=norm_elementwise_affine,
                     norm_eps=norm_eps,
                     use_rotary_pos_embed=use_rotary_pos_embed,
+                    max_trained_sequence_length=self.sequence_length,
                 )
                 for d in range(num_layers)
             ]
@@ -278,7 +282,7 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
         attention_mask: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         return_dict: bool = True,
-        sincos_pos_embed_strength: float = 1.0,
+        absolute_pos_embed_strength: float = 1.0,
         enable_padding: bool = False,
     ):
         batch_size = hidden_states.shape[0]
@@ -296,7 +300,7 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
                 hidden_states,
                 height=height_patches,
                 width=width_patches,
-                strength=sincos_pos_embed_strength,
+                strength=absolute_pos_embed_strength,
             )
 
         pad_length = None
