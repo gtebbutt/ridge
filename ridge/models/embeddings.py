@@ -90,6 +90,17 @@ class PositionEmbed(nn.Module):
         else:
             pos_embed = self.pos_embed
 
+        # Zero-pad pos_embed to match padded latent, if required
+        if pos_embed.shape[1] < latent.shape[1]:
+            padding_length = latent.shape[1] - pos_embed.shape[1]
+            pos_embed = F.pad(
+                pos_embed,
+                (0, 0,
+                 0, padding_length),
+                mode="constant",
+                value=0,
+            )
+
         return (latent + (pos_embed * strength)).to(latent.dtype)
 
 
@@ -190,13 +201,15 @@ class MultiAxisRotaryPositionEmbed(nn.Module):
             freqs = torch.stack([freqs.cos(), freqs.sin()], dim=-1)
 
             # If sequence_length is longer than the multiple of all of our axes, that means it's been zero-padded and we need to do the same to the embeddings
-            pad_length = sequence_length - reduce(lambda a, b: a * b, shape)
+            padding_length = sequence_length - reduce(lambda a, b: a * b, shape)
             freqs = F.pad(
-                freqs.transpose(0, 2),
-                (0, pad_length),
+                freqs,
+                (0, 0,
+                 0, 0,
+                 0, padding_length),
                 mode="constant",
                 value=0,
-            ).transpose(0, 2)
+            )
 
             # Add singleton dimensions for batch and attention head count
             freqs = freqs.unsqueeze(0).unsqueeze(2).to(query.device)
