@@ -107,7 +107,7 @@ class PositionEmbed(nn.Module):
 def multiply_as_complex(a, b):
     # Elementwise multiplication of complex numbers represented using an extra dimension, to avoid breaking torch.compile by using actual complex dtypes. Assumes final dimension of tensor is length 2 with format (real, imaginary)
     if a.shape[-1] != b.shape[-1] or a.shape[-1] != 2:
-        raise ValueError(f"Expected both tensors to have (real, complex) as their final dimension, but got shapes {a.shape} and {b.shape}")
+        raise ValueError(f"Expected both tensors to have (real, imaginary) as their final dimension, but got shapes {a.shape} and {b.shape}")
 
     return torch.stack([
         (a[..., -1] * b[..., -1]) - (a[..., -2] * b[..., -2]),
@@ -169,7 +169,7 @@ class MultiAxisRotaryPositionEmbed(nn.Module):
         # Factor of two per axis to account for the fact we'll be repeating this for each axis, and then using the overall result twice to get the sin and cos components in the forward function
         base_freqs = 1.0 / (theta ** (torch.arange(0, self.embed_dim, 2 * self.axes).to(dtype=torch.float32) / self.embed_dim))
 
-        freqs = [torch.outer(pos.flatten(), base_freqs) for pos in reversed(axis_positions)]
+        freqs = [torch.outer(pos.flatten(), base_freqs) for pos in axis_positions]
 
         # Einops accepts a list of tensors and treats it as if the values were already stacked into a single tensor, which makes things easier here
         # Using torch.cat(..., dim=-1) directly would be equivalent to "a n d -> n (a d)", which gives the shape we want but not the correct ordering of elements within the tensor; the alternative is to stack along a new final dimension and then reshape, but rearrange makes things more readable. Ordering matters here because we're emulating the way torch handles complex polar values

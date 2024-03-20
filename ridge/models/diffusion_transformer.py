@@ -235,6 +235,8 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
 
         self.proj_out = nn.Linear(inner_dim, patch_size * patch_size * self.out_channels)
 
+        self.gradient_checkpointing = False
+
     # The additional keys this is converting aren't deprecated per se, just different to the ones diffusers uses, but extending this function is by far the easiest way to ensure they're patched in the right place
     def _convert_deprecated_attention_blocks(self, state_dict: OrderedDict) -> None:
         super()._convert_deprecated_attention_blocks(state_dict)
@@ -328,7 +330,7 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
                     mode="constant",
                     value=0,
                 )
-        
+
         return torch.cat(batch, dim=0), shapes_patches, torch.cat(attention_masks, dim=0)
 
     def unpad_and_reshape(
@@ -344,6 +346,8 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
             latents[i] = latents[i][:, :sequence_length]
             latents[i] = latents[i].unfold(1, size=self.patch_size, step=self.patch_size)
             latents[i] = rearrange(latents[i], "c (h w) pw ph -> c (h ph) (w pw)", c=num_channels, h=height_patches)
+            # Add a batch axis back for consistency with input format
+            latents[i] = latents[i].unsqueeze(0)
 
         return latents
 
@@ -417,6 +421,7 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
                     timestep,
                     cross_attention_kwargs,
                     class_labels,
+                    shapes_patches,
                     **ckpt_kwargs,
                 )
             else:
