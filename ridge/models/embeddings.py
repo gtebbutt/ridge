@@ -167,7 +167,6 @@ class MultiAxisRotaryPositionEmbed(nn.Module):
             if ntk_alpha is not None:
                 raise ValueError(f"ntk_alpha is an inference parameter and should not be set during training; training_interpolation_scale should be used as the alpha value for training - see comments in ridge.models.embeddings for further details")
 
-        
         if ntk_alpha is None:
             if self.dynamic_interpolation:
                 # 1.0 means no further scaling
@@ -225,6 +224,7 @@ class MultiAxisRotaryPositionEmbed(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
         shapes: List[List[int]],
+        ntk_alpha: Optional[int] = None,
     ):
         if len(set(shapes)) != 1:
             raise NotImplementedError(f"Heterogeneous batches are not yet supported")
@@ -237,7 +237,7 @@ class MultiAxisRotaryPositionEmbed(nn.Module):
 
         # Always run these calculations in fp32, even if autocast is enabled - longer sequences get unstable if the sin and cos values are handled in reduced precision
         with torch.cuda.amp.autocast(enabled=False):
-            freqs = self.calculate_freqs(shape) # (n d/2)
+            freqs = self.calculate_freqs(shape, ntk_alpha) # (n d/2)
 
             # Equivalent to torch.polar but using the last dimension for (real, imaginary) rather than using complex dtypes, as they aren't compatible with torch.compile
             freqs = torch.stack([freqs.cos(), freqs.sin()], dim=-1)
@@ -272,7 +272,7 @@ class AdaLNEmbed(nn.Module):
         self,
         embedding_dim: int,
         num_embeddings: Optional[int] = None,
-        use_additional_conditions: bool = False
+        use_additional_conditions: bool = False,
     ):
         super().__init__()
 

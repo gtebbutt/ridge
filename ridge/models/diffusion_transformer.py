@@ -87,6 +87,7 @@ class DiffusionTransformerBlock(nn.Module):
         cross_attention_kwargs: Dict[str, Any] = None,
         class_labels: Optional[torch.LongTensor] = None,
         shapes_patches: Optional[List[Tuple[int, int]]] = None,
+        ntk_alpha: Optional[int] = None,
     ) -> torch.FloatTensor:
         batch_size = hidden_states.shape[0]
 
@@ -114,6 +115,7 @@ class DiffusionTransformerBlock(nn.Module):
             encoder_hidden_states=None,
             attention_mask=attention_mask,
             shapes_patches=shapes_patches,
+            ntk_alpha=ntk_alpha,
             **cross_attention_kwargs,
         )
 
@@ -129,6 +131,7 @@ class DiffusionTransformerBlock(nn.Module):
                 encoder_hidden_states=encoder_hidden_states,
                 attention_mask=encoder_attention_mask,
                 shapes_patches=shapes_patches,
+                ntk_alpha=ntk_alpha,
                 **cross_attention_kwargs,
             )
             hidden_states = attn_output + hidden_states
@@ -368,6 +371,7 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
         absolute_pos_embed_strength: float = 1.0,
         # (h w) shape, in patches, for each item in the batch - important to know if they've been padded, and/or to properly encode positions of images that are the same total number of patches but a different aspect ratio
         shapes_patches: List[Tuple[int, int]] = None,
+        ntk_alpha: Optional[int] = None,
         return_dict: bool = True,
     ):
         batch_size = hidden_states.shape[0]
@@ -426,6 +430,7 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
                     cross_attention_kwargs,
                     class_labels,
                     shapes_patches,
+                    ntk_alpha,
                     **ckpt_kwargs,
                 )
             else:
@@ -438,6 +443,7 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
                     cross_attention_kwargs=cross_attention_kwargs,
                     class_labels=class_labels,
                     shapes_patches=shapes_patches,
+                    ntk_alpha=ntk_alpha,
                 )
 
         if self.adaln_embed is None:

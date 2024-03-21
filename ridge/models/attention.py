@@ -59,6 +59,7 @@ class Attention(nn.Module):
         encoder_hidden_states: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         shapes_patches: Optional[List[Tuple[int, int]]] = None,
+        ntk_alpha: Optional[int] = None,
         **cross_attention_kwargs,
     ) -> torch.Tensor:
         return self.processor(
@@ -67,6 +68,7 @@ class Attention(nn.Module):
             encoder_hidden_states=encoder_hidden_states,
             attention_mask=attention_mask,
             shapes_patches=shapes_patches,
+            ntk_alpha=ntk_alpha,
             **cross_attention_kwargs,
         )
 
@@ -84,6 +86,7 @@ class RotaryAttnProcessor:
         encoder_hidden_states: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         shapes_patches: Optional[List[Tuple[int, int]]] = None,
+        ntk_alpha: Optional[int] = None,
     ) -> torch.FloatTensor:
         batch_size, _, _ = (
             hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
@@ -114,7 +117,7 @@ class RotaryAttnProcessor:
         key = key.view(batch_size, -1, attn.heads, head_dim)
 
         if attn.rotary_emb is not None:
-            query, key = attn.rotary_emb(query, key, shapes_patches)
+            query, key = attn.rotary_emb(query, key, shapes_patches, ntk_alpha)
 
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)

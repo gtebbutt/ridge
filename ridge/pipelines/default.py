@@ -120,6 +120,7 @@ class RidgePipeline(DiffusionPipeline):
         # List of (h w) tuples, in pixels, one per class label
         # NB: if one batch item is significantly larger (in terms of overall pixel count, h*w) than the rest, it's generally more efficient to run it separately - by necessity all inputs will be padded to the size of the largest, which can be wasteful if there's a big gap between sizes
         sizes: Optional[List[Tuple[int, int]]] = None,
+        ntk_alpha: Optional[int] = None,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         output_type: Optional[str] = "pil",
         # Used during training validation
@@ -196,6 +197,7 @@ class RidgePipeline(DiffusionPipeline):
                     shapes_patches=shapes_patches,
                     attention_mask=attention_mask,
                     timestep=current_timestep,
+                    ntk_alpha=ntk_alpha,
                     absolute_pos_embed_strength=absolute_pos_embed_strength,
                     return_dict=False,
                 )[0]
