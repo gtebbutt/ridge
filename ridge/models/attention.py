@@ -20,7 +20,7 @@ class Attention(nn.Module):
         out_bias: bool = True,
         eps: float = 1e-5,
         use_rotary_pos_embed: bool = False,
-        max_trained_sequence_length: Optional[int] = None,
+        rotary_pos_embed_kwargs: Optional[dict] = None,
     ):
         super().__init__()
         self.inner_dim = dim_head * heads
@@ -32,7 +32,7 @@ class Attention(nn.Module):
         if use_rotary_pos_embed:
             self.rotary_emb = MultiAxisRotaryPositionEmbed(
                 embed_dim=self.query_dim // self.heads,
-                max_trained_sequence_length=max_trained_sequence_length,
+                **rotary_pos_embed_kwargs,
             )
         else:
             self.rotary_emb = None

@@ -32,7 +32,7 @@ class DiffusionTransformerBlock(nn.Module):
         norm_type: str,
         norm_eps: float,
         use_rotary_pos_embed: bool = False,
-        max_trained_sequence_length: Optional[int] = None,
+        rotary_pos_embed_kwargs: Optional[dict] = None,
     ):
         super().__init__()
 
@@ -51,7 +51,7 @@ class DiffusionTransformerBlock(nn.Module):
             bias=attention_bias,
             cross_attention_dim=None,
             use_rotary_pos_embed=use_rotary_pos_embed,
-            max_trained_sequence_length=max_trained_sequence_length,
+            rotary_pos_embed_kwargs=rotary_pos_embed_kwargs,
         )
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine, eps=norm_eps)
@@ -64,7 +64,7 @@ class DiffusionTransformerBlock(nn.Module):
                 dim_head=attention_head_dim,
                 bias=attention_bias,
                 use_rotary_pos_embed=use_rotary_pos_embed,
-                max_trained_sequence_length=max_trained_sequence_length,
+                rotary_pos_embed_kwargs=rotary_pos_embed_kwargs,
             )
         else:
             self.attn2 = None
@@ -166,6 +166,7 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
         # It won't make sense to enable both of these in normal use, but it's important for training to allow one to be phased out in favour of the other over the course of a few thousand steps
         use_absolute_pos_embed: bool = True,
         use_rotary_pos_embed: bool = False,
+        rotary_pos_embed_kwargs: Optional[dict] = None,
     ):
         super().__init__()
 
@@ -175,9 +176,12 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
 
         self.patch_size = patch_size
 
-        # Note that these dimensions are in latent space, so will be 8x smaller than pixel values (assuming default VAE scale factor)
-        # Currently assumes square patches in two dimensions, but can easily be extended
-        max_trained_sequence_length = (sample_size ** 2) // (self.patch_size ** 2)
+        rotary_pos_embed_kwargs = {} if rotary_pos_embed_kwargs is None else rotary_pos_embed_kwargs
+
+        if rotary_pos_embed_kwargs.get("max_trained_sequence_length") is None:
+            # Note that these dimensions are in latent space, so will be 8x smaller than pixel values (assuming default VAE scale factor)
+            # Currently assumes square patches in two dimensions, but can easily be extended
+            rotary_pos_embed_kwargs["max_trained_sequence_length"] = (sample_size ** 2) // (self.patch_size ** 2)
 
         # This just does the patching, rather than treating patching and position embedding as a single operation
         self.patch_embed = PatchEmbed(
@@ -215,7 +219,7 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
                     norm_elementwise_affine=norm_elementwise_affine,
                     norm_eps=norm_eps,
                     use_rotary_pos_embed=use_rotary_pos_embed,
-                    max_trained_sequence_length=max_trained_sequence_length,
+                    rotary_pos_embed_kwargs=rotary_pos_embed_kwargs,
                 )
                 for d in range(num_layers)
             ]
