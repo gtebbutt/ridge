@@ -122,7 +122,7 @@ class RidgePipeline(DiffusionPipeline):
     ):
         class_labels = torch.tensor(class_labels * num_images_per_prompt, device=device)
         if do_classifier_free_guidance:
-            class_nulls = torch.tensor([1000] * len(class_labels) * num_images_per_prompt, device=device)
+            class_nulls = torch.tensor([1000] * len(class_labels), device=device)
             # Doesn't specifically matter whether this is nulls first or labels first, just has to match the order of noise_pred_uncond, noise_pred_cond after the prediction is run
             class_labels = torch.cat([class_nulls, class_labels], dim=0)
 
@@ -227,7 +227,7 @@ class RidgePipeline(DiffusionPipeline):
 
         if isinstance(class_labels, int):
             class_labels = [class_labels]
-        
+
         if isinstance(prompts, str):
             prompts = [prompts]
 
@@ -350,7 +350,8 @@ class RidgePipeline(DiffusionPipeline):
             output = []
             for i, latent in enumerate(latents):
                 image = self.vae.decode(latent / self.vae.config.scaling_factor, return_dict=False)[0]
-                h, w = sizes[i % num_images_per_prompt]
+                # i may be greater than len(sizes) when num_images_per_prompt > 1
+                h, w = sizes[i % len(sizes)]
                 image = self.resize_and_crop(image, h, w)[0]
                 # This is returned as a list since it's treated as a one-item batch
                 image = self.image_processor.postprocess(image, output_type=output_type)
