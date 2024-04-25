@@ -158,7 +158,8 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
         num_layers: int,
         cross_attention_dim: Optional[int] = None,
         attention_bias: bool = False,
-        sample_size: int,
+        # sample_size should only be used for backwards compatibility when loading diffusers models; it will be ignored in favour of rotary_pos_embed_kwargs["max_trained_sequence_length"] where possible
+        sample_size: Optional[int] = None,
         patch_size: int,
         activation_fn: str,
         num_embeds_ada_norm: Optional[int] = None,
@@ -183,7 +184,7 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
 
         if rotary_pos_embed_kwargs.get("max_trained_sequence_length") is None:
             # Note that these dimensions are in latent space, so will be 8x smaller than pixel values (assuming default VAE scale factor)
-            # Currently assumes square patches in two dimensions, but can easily be extended
+            # Diffusers models infer interpolation scale and sequence length based on sample_size, but that assumes square outputs in two dimensions - converted models will have max_trained_sequence_length set directly, agnostic to the shape or layout of that sequence, so this calculation will only be used when loading unconverted model config
             rotary_pos_embed_kwargs["max_trained_sequence_length"] = (sample_size ** 2) // (self.patch_size ** 2)
 
         # This just does the patching, rather than treating patching and position embedding as a single operation
@@ -195,6 +196,7 @@ class DiffusionTransformerModel(ModelMixin, ConfigMixin):
 
         if use_absolute_pos_embed:
             # Assumes the default sample size is 512x512px with an 8x VAE reduction (i.e. 64x64 latents)
+            # This is deliberately handled separately from rotary_pos_embed_kwargs["training_interpolation_scale"], although they represent the same type of scaling - this value is calculated in the same way as the diffusers model defaults, whereas the rotary version is passed at training time and stored in the model config; important for them to be distinct if converting from an interpolated absolute embedding to a non-interpolated rotary embedding
             interpolation_scale = sample_size // 64
             interpolation_scale = max(interpolation_scale, 1)
 

@@ -48,6 +48,17 @@ def save_modified_config(
 
     config_dict["use_absolute_pos_embed"] = False
 
+    if config_dict.get("rotary_pos_embed_kwargs") is not None:
+        raise ValueError(f"Trying to convert config but got unexpected value for rotary_pos_embed_kwargs: {config.get('rotary_pos_embed_kwargs')}")
+    
+    if not config_dict.get("sample_size"):
+        raise ValueError(f"Trying to convert config but got unexpected value for sample_size: {config.get('sample_size')}")
+
+    # The model uses max_trained_sequence_length rather than sample_size, for greater overall flexibility - doesn't need to assume anything about the layout, just need to know how many data points there are
+    # In this specific case sample_size will always be nominally square, because this is only called when converting from absolute embeddings, so it's easy to calculate the implied sequence length
+    config_dict["rotary_pos_embed_kwargs"] = {"max_trained_sequence_length": (config_dict["sample_size"] ** 2) // (config_dict["patch_size"] ** 2)}
+    config_dict["sample_size"] = None
+
     with open(primary_path, "w", encoding="utf-8") as f:
         f.write(to_json(config_dict))
     
@@ -423,7 +434,7 @@ def get_args():
     parser.add_argument("--adam_weight_decay", type=int, default=0)
     parser.add_argument("--max_grad_norm", type=float, default=1)
     parser.add_argument("--proportion_null_inputs", type=float, default=0.1, help="Input dropout, for CFG support. Applies whether input type is text prompts or class labels")
-    
+
     # Specific flags for phased conversion of existing models from absolute to rotary embedding
     parser.add_argument("--convert_pos_embeddings", action="store_true", help="Convert the absolute position embeddings of an existing model to rotary embeddings, incrementally stepping down the strength of the absolute embeddings to preserve overall model quality as it learns the equivalent rotary embeddings")
     parser.add_argument("--abs_pos_strength_decay", type=float, default=0.3, help="Exponential decay coefficient, applied to the absolute position embedding strength once every --abs_pos_strength_decay_epochs; skews the training towards more time spent at lower guidance from the absolute embeddings, to avoid spending too much time on data dominated by values the model already knows. Does nothing if --convert_pos_embeddings is not set")
