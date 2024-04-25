@@ -154,6 +154,7 @@ class MultiAxisRotaryPositionEmbed(nn.Module):
     def calculate_freqs(
         self,
         shape: List[int],
+        tensor_sequence_length: int,
         # Functionally equivalent to alpha in the original dynamic NTK release, but also accounts for separate fine tuning with NTK scaling; values somewhere around 2.0 to 4.0 are generally reasonable
         ntk_alpha: Optional[float] = None,
     ):
@@ -175,6 +176,7 @@ class MultiAxisRotaryPositionEmbed(nn.Module):
             if not self.dynamic_interpolation:
                 raise ValueError(f"ntk_alpha is only compatible with dynamic interpolation. To statically scale the whole embedding space (NTK-aware interpolation), use training_interpolation_scale as the alpha value")
 
+        # Using the shape value ensures that any interpolation is based on the actual input size, not on the padded sequence length within the batched tensor
         input_sequence_length = reduce(lambda a, b: a * b, shape)
 
         if self.interpolation_type is None:
@@ -217,7 +219,38 @@ class MultiAxisRotaryPositionEmbed(nn.Module):
         # Einops accepts a list of tensors and treats it as if the values were already stacked into a single tensor, which makes things easier here
         # Using torch.cat(..., dim=-1) directly would be equivalent to "a n d -> n (a d)", which gives the shape we want but not the correct ordering of elements within the tensor; the alternative is to stack along a new final dimension and then reshape, but rearrange makes things more readable. Ordering matters here because we're emulating the way torch handles complex polar values
         # Returns shape (n, self.embed_dim / 2)
-        return rearrange(freqs, "a n d -> n (d a)")
+        freqs = rearrange(freqs, "a n d -> n (d a)")
+
+        # Equivalent to torch.polar but using the last dimension for (real, imaginary) rather than using complex dtypes, as they aren't compatible with torch.compile
+        freqs = torch.stack([freqs.cos(), freqs.sin()], dim=-1)
+
+        # If sequence_length is longer than the multiple of all of our axes, that means it's been zero-padded and we need to do the same to the embeddings
+        padding_length = tensor_sequence_length - reduce(lambda a, b: a * b, shape)
+        return F.pad(
+            freqs,
+            (0, 0,
+            0, 0,
+            0, padding_length),
+            mode="constant",
+            value=0,
+        )
+
+    
+    # Wrapper to ensure that calling code can easily create the frequencies tensor in an identical way to the forward function (e.g. for caching)
+    def calculate_batch_freqs(
+        self,
+        shapes: List[List[int]],
+        tensor_sequence_length: int,
+        ntk_alpha: Optional[float] = None,
+    ):
+        freqs = []
+        # Calculate freqs for each shape in the batch separately, to allow for heterogeneous batches
+        for shape in shapes:
+            freqs.append(self.calculate_freqs(shape, tensor_sequence_length, ntk_alpha))
+
+        # Stack along batch axis and add singleton dimension for attention head count
+        return torch.stack(freqs).unsqueeze(2)
+
 
     def forward(
         self,
@@ -225,36 +258,21 @@ class MultiAxisRotaryPositionEmbed(nn.Module):
         key: torch.Tensor,
         shapes: List[List[int]],
         ntk_alpha: Optional[int] = None,
+        freqs: Optional[torch.Tensor] = None,
     ):
-        if len(set(shapes)) != 1:
-            raise NotImplementedError(f"Heterogeneous batches are not yet supported")
-        else:
-            shape = shapes[0]
-
         # Query and key shape are both (b n h d) where h is num_attention_heads and d is attention_head_dim (which should be equal to embed_dim); for DiT and Pixart models num_attention_heads=16 and attention_head_dim=72
         sequence_length = query.shape[1]
         input_dtype = query.dtype
 
         # Always run these calculations in fp32, even if autocast is enabled - longer sequences get unstable if the sin and cos values are handled in reduced precision
         with torch.cuda.amp.autocast(enabled=False):
-            freqs = self.calculate_freqs(shape, ntk_alpha) # (n d/2)
+            # There are a lot of cases where the same `freqs` tensor will be reused multiple times (at minimum for the multiple steps using the same latents within a given diffusion run), but trying to use a buffer to cache the value inside this class is inflexible and error-prone, and can break assumptions made by torch.compile
+            # Optionally passing the tensor into this function as an argument allows the value to be easily calculated and cached by calling code (e.g. at the pipeline level) without imposing any assumptions or potentially unwanted state on the model as a whole
+            # If internal caching in a buffer is needed for any reason, this also makes it trivial to implement using a wrapper class
+            if freqs is None:
+                freqs = self.calculate_batch_freqs(shapes, sequence_length, ntk_alpha)
 
-            # Equivalent to torch.polar but using the last dimension for (real, imaginary) rather than using complex dtypes, as they aren't compatible with torch.compile
-            freqs = torch.stack([freqs.cos(), freqs.sin()], dim=-1)
-
-            # If sequence_length is longer than the multiple of all of our axes, that means it's been zero-padded and we need to do the same to the embeddings
-            padding_length = sequence_length - reduce(lambda a, b: a * b, shape)
-            freqs = F.pad(
-                freqs,
-                (0, 0,
-                 0, 0,
-                 0, padding_length),
-                mode="constant",
-                value=0,
-            )
-
-            # Add singleton dimensions for batch and attention head count
-            freqs = freqs.unsqueeze(0).unsqueeze(2).to(query.device)
+            freqs = freqs.to(query.device)
 
             # Reshape into complex polar form, and cast to fp32 to maintain precision when multiplying
             query = query.reshape(*query.shape[:-1], -1, 2).to(torch.float32)
