@@ -26,6 +26,11 @@ from ridge.pipelines.default import RidgePipeline
 logger = get_logger(__name__, log_level="INFO")
 
 
+def to_json(obj):
+    # Output format matches diffusers ConfigMixin.to_json_file()
+    return f"{json.dumps(obj, indent=2, sort_keys=True)}\n"
+
+
 # During conversion the model will have both types of embedding enabled in the config, but that's unlikely to be useful when loading for inference later, so this modifies the json file to match what we'll actually want
 def save_modified_config(
     save_path: str,
@@ -44,8 +49,7 @@ def save_modified_config(
     config_dict["use_absolute_pos_embed"] = False
 
     with open(primary_path, "w", encoding="utf-8") as f:
-        # Output format matches diffusers ConfigMixin.to_json_file()
-        f.write(f"{json.dumps(config_dict, indent=2, sort_keys=True)}\n")
+        f.write(to_json(config_dict))
     
     if not keep_original:
         os.remove(interim_path)
@@ -57,7 +61,7 @@ def save_conversion_state(
 ):
     conversion_info = {"absolute_pos_embed_strength": absolute_pos_embed_strength}
     with open(os.path.join(save_path, "conversion_state.json"), "w", encoding="utf-8") as f:
-        f.write(f"{json.dumps(conversion_info, indent=2, sort_keys=True)}\n")
+        f.write(to_json(conversion_info))
 
 
 @torch.inference_mode()
@@ -306,6 +310,10 @@ def main(args):
         log_with=None,
         project_config=ProjectConfiguration(project_dir=args.output_dir, logging_dir=os.path.join(args.output_dir, "logs")),
     )
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    with open(os.path.join(args.output_dir, "args.json"), "w", encoding="utf-8") as f:
+        f.write(to_json(vars(args)))
 
     noise_scheduler = DDPMScheduler.from_pretrained(
         args.base_model_path,
