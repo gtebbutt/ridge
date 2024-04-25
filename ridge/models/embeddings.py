@@ -69,39 +69,39 @@ class PositionEmbed(nn.Module):
         if not (0.0 <= strength <= 1.0):
             raise ValueError(f"Invalid PositionEmbed strength {strength}, values must be between 0 and 1")
 
-        if len(set(shapes)) != 1:
-            raise NotImplementedError(f"Heterogeneous batches are not yet supported")
-        else:
-            height, width = shapes[0]
-
         if strength == 0:
             return latent
 
-        # See diffusers implementation and/or Pixart paper for info on this
-        if self.height != height or self.width != width:
-            pos_embed = get_2d_sincos_pos_embed(
-                embed_dim=self.embed_dim,
-                grid_size=(height, width),
-                base_size=self.base_size,
-                interpolation_scale=self.interpolation_scale,
-            )
-            pos_embed = torch.from_numpy(pos_embed)
-            pos_embed = pos_embed.float().unsqueeze(0).to(latent.device)
-        else:
-            pos_embed = self.pos_embed
+        pos_embeds = []
 
-        # Zero-pad pos_embed to match padded latent, if required
-        if pos_embed.shape[1] < latent.shape[1]:
-            padding_length = latent.shape[1] - pos_embed.shape[1]
-            pos_embed = F.pad(
-                pos_embed,
-                (0, 0,
-                 0, padding_length),
-                mode="constant",
-                value=0,
-            )
+        # Separate calculation for each item to allow for heterogeneous batches
+        for height, width in shapes:
+            # See diffusers implementation and/or Pixart paper for info on this
+            if self.height != height or self.width != width:
+                pos_embeds.append(get_2d_sincos_pos_embed(
+                    embed_dim=self.embed_dim,
+                    grid_size=(height, width),
+                    base_size=self.base_size,
+                    interpolation_scale=self.interpolation_scale,
+                ))
+                pos_embeds[-1] = torch.from_numpy(pos_embeds[-1]).float().unsqueeze(0).to(latent.device)
+            else:
+                pos_embeds.append(self.pos_embed)
 
-        return (latent + (pos_embed * strength)).to(latent.dtype)
+            # Zero-pad pos_embed to match padded latent, if required
+            if pos_embeds[-1].shape[1] < latent.shape[1]:
+                padding_length = latent.shape[1] - pos_embeds[-1].shape[1]
+                pos_embeds[-1] = F.pad(
+                    pos_embeds[-1],
+                    (0, 0,
+                    0, padding_length),
+                    mode="constant",
+                    value=0,
+                )
+
+        pos_embeds = torch.cat(pos_embeds)
+
+        return (latent + (pos_embeds * strength)).to(latent.dtype)
 
 
 def multiply_as_complex(a, b):
