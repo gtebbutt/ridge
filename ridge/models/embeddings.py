@@ -225,7 +225,7 @@ class MultiAxisRotaryPositionEmbed(nn.Module):
         freqs = torch.stack([freqs.cos(), freqs.sin()], dim=-1)
 
         # If sequence_length is longer than the multiple of all of our axes, that means it's been zero-padded and we need to do the same to the embeddings
-        padding_length = tensor_sequence_length - reduce(lambda a, b: a * b, shape)
+        padding_length = tensor_sequence_length - input_sequence_length
         return F.pad(
             freqs,
             (0, 0,
