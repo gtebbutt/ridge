@@ -1,6 +1,8 @@
 # Basic training script for initial proof of concept on classified inputs
 
 import os
+import math
+import json
 import random
 import argparse
 import functools
@@ -24,6 +26,40 @@ from ridge.pipelines.default import RidgePipeline
 logger = get_logger(__name__, log_level="INFO")
 
 
+# During conversion the model will have both types of embedding enabled in the config, but that's unlikely to be useful when loading for inference later, so this modifies the json file to match what we'll actually want
+def save_modified_config(
+    save_path: str,
+    keep_original: bool = True,
+):
+    primary_path = os.path.join(save_path, "config.json")
+    interim_path = os.path.join(save_path, "interim_config.json")
+    os.rename(primary_path, interim_path)
+
+    with open(interim_path) as f:
+        config_dict = json.load(f)
+
+    if not config_dict.get("use_absolute_pos_embed"):
+        raise ValueError(f"Trying to convert config but got unexpected value for use_absolute_pos_embed: {config.get('use_absolute_pos_embed')}")
+
+    config_dict["use_absolute_pos_embed"] = False
+
+    with open(primary_path, "w", encoding="utf-8") as f:
+        # Output format matches diffusers ConfigMixin.to_json_file()
+        f.write(f"{json.dumps(config_dict, indent=2, sort_keys=True)}\n")
+    
+    if not keep_original:
+        os.remove(interim_path)
+
+
+def save_conversion_state(
+    save_path: str,
+    absolute_pos_embed_strength: int,
+):
+    conversion_info = {"absolute_pos_embed_strength": absolute_pos_embed_strength}
+    with open(os.path.join(save_path, "conversion_state.json"), "w", encoding="utf-8") as f:
+        f.write(f"{json.dumps(conversion_info, indent=2, sort_keys=True)}\n")
+
+
 @torch.inference_mode()
 def run_validation(
     *,
@@ -34,6 +70,7 @@ def run_validation(
     output_suffix: str,
     seed: int,
     num_images_per_prompt: int,
+    absolute_pos_embed_strength: float,
     weight_dtype: torch.dtype,
     model_save_path: Optional[str] = None,
 ):
@@ -50,10 +87,16 @@ def run_validation(
         if model_save_path is not None:
             pipe.save_pretrained(os.path.join(output_dir, model_save_path))
 
+            if absolute_pos_embed_strength != 1.0:
+                save_modified_config(os.path.join(output_dir, model_save_path, "transformer"), keep_original=False)
+
         pipe.to(accelerator.device)
 
         validation_folder = os.path.join(output_dir, "samples", f"samples-{output_suffix}")
         os.makedirs(validation_folder, exist_ok=True)
+
+        if absolute_pos_embed_strength != 1.0:
+            save_conversion_state(validation_folder, absolute_pos_embed_strength)
 
         # Nothing inherently special about this choice of labels, it just matches the ones used in the original facebookresearch/DiT repo for easier comparison
         class_labels = [207, 360, 387, 974, 88, 979, 417, 279]
@@ -80,6 +123,7 @@ def run_validation(
                         sizes=[size],
                         generator=generator,
                         num_images_per_prompt=num_images_per_prompt,
+                        absolute_pos_embed_strength=absolute_pos_embed_strength,
                     )[0]
                 
                 h, w = size
@@ -114,6 +158,9 @@ def training_loop(
 
     error_count = 0
 
+    # Always initialise to 1.0 - will do nothing if absolute embeddings are not used, and will remain at 1.0 (i.e. use the unmodified embeddings) if --convert_pos_embeddings is not set
+    absolute_pos_embed_strength = 1.0
+
     for epoch in range(args.num_epochs):
         for epoch_step, batch in enumerate(dataloader):
             # Validation first, so it always runs on step zero before the weights are modified - particularly useful to get baseline output when fine tuning from an existing model
@@ -126,8 +173,16 @@ def training_loop(
                     output_suffix=str(global_step),
                     seed=args.seed,
                     num_images_per_prompt=args.validation_images_per_prompt,
+                    absolute_pos_embed_strength=absolute_pos_embed_strength,
                     weight_dtype=weight_dtype,
                 )
+
+            if args.convert_pos_embeddings and absolute_pos_embed_strength > 0 and global_step % int(args.abs_pos_strength_decay_epochs * steps_per_epoch) == 0:
+                # This doesn't explicitly have to be exponential decay, but empirically it works well to drop the initial value quickly and then spend more time training in the 0.1 - 0.01 strength range
+                absolute_pos_embed_strength = absolute_pos_embed_strength * math.exp(-args.abs_pos_strength_decay)
+
+            if absolute_pos_embed_strength < args.abs_pos_strength_threshold:
+                absolute_pos_embed_strength = 0
 
             if not batch:
                 logger.error(f"Skipping step {global_step} due to a batch loading error")
@@ -165,6 +220,7 @@ def training_loop(
                     attention_mask=attention_mask,
                     timestep=timestep,
                     return_dict=False,
+                    absolute_pos_embed_strength=absolute_pos_embed_strength,
                     **model_kwargs,
                 )[0]
 
@@ -195,6 +251,10 @@ def training_loop(
                     os.makedirs(save_path, exist_ok=True)
                     model.save_pretrained(save_path)
 
+                    if args.convert_pos_embeddings:
+                        save_conversion_state(save_path, absolute_pos_embed_strength)
+                        save_modified_config(save_path, keep_original=(absolute_pos_embed_strength > 0))
+
     accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
@@ -206,6 +266,7 @@ def training_loop(
             output_suffix="final",
             seed=args.seed,
             num_images_per_prompt=args.validation_images_per_prompt,
+            absolute_pos_embed_strength=absolute_pos_embed_strength,
             weight_dtype=weight_dtype,
             # Saves the full pipeline state to `args.output_dir/final` before validating
             model_save_path="final",
@@ -224,7 +285,7 @@ def collate_fn(examples, proportion_null_inputs):
     class_labels = torch.cat([
         torch.tensor([int(example["metadata"]["label"])])
         if random.random() > proportion_null_inputs else
-        torch.tensor([1000])
+        torch.tensor([1000]) # Null label to allow for cfg in the trained model - imagenet classes run 0-999, with 1000 defined as null
         for example in examples
     ])
 
@@ -254,10 +315,36 @@ def main(args):
 
     transformer_base_path = args.base_model_path if args.transformer_path is None else args.transformer_path
 
-    if args.train_from_scratch:
-        diffusion_transformer = DiffusionTransformerModel.from_config(DiffusionTransformerModel.load_config(transformer_base_path, subfolder="transformer"))
+    # Override the model config and enable both embeddings simultaneously when converting an existing model. DiffusionTransformerModel.from_pretrained will pass the additional kwargs down to from_config, which in turn passes them to extract_init_dict where they will overwrite the values from config.json
+    if args.convert_pos_embeddings:
+        constructor_kwargs = {
+            "use_absolute_pos_embed": True,
+            "use_rotary_pos_embed": True,
+        }
     else:
-        diffusion_transformer = DiffusionTransformerModel.from_pretrained(transformer_base_path, subfolder="transformer")
+        constructor_kwargs = {}
+
+    if args.train_from_scratch:
+        if args.convert_pos_embeddings:
+            raise ValueError("Converting embeddings is not possible when training from scratch - there are no existing weights to convert")
+
+        diffusion_transformer = DiffusionTransformerModel.from_config(
+            DiffusionTransformerModel.load_config(transformer_base_path, subfolder="transformer"),
+            **constructor_kwargs
+        )
+    else:
+        diffusion_transformer = DiffusionTransformerModel.from_pretrained(
+            transformer_base_path,
+            subfolder="transformer",
+            **constructor_kwargs
+        )
+
+    # Ensure that the config overrides were applied correctly
+    if args.convert_pos_embeddings:
+        if diffusion_transformer.pos_embed is None:
+            raise RuntimeError("--convert_pos_embeddings is set, but the absolute position embeddings were not created")
+        if diffusion_transformer.transformer_blocks[0].attn1.rotary_emb is None:
+            raise RuntimeError("--convert_pos_embeddings is set, but the rotary position embeddings were not created")
 
     # For now this just follows what the torch the defaults would do anyway, but it's useful to have here as a placeholder if we do need to freeze certain layers later
     diffusion_transformer.requires_grad_(True)
@@ -328,6 +415,12 @@ def get_args():
     parser.add_argument("--adam_weight_decay", type=int, default=0)
     parser.add_argument("--max_grad_norm", type=float, default=1)
     parser.add_argument("--proportion_null_inputs", type=float, default=0.1, help="Input dropout, for CFG support. Applies whether input type is text prompts or class labels")
+    
+    # Specific flags for phased conversion of existing models from absolute to rotary embedding
+    parser.add_argument("--convert_pos_embeddings", action="store_true", help="Convert the absolute position embeddings of an existing model to rotary embeddings, incrementally stepping down the strength of the absolute embeddings to preserve overall model quality as it learns the equivalent rotary embeddings")
+    parser.add_argument("--abs_pos_strength_decay", type=float, default=0.3, help="Exponential decay coefficient, applied to the absolute position embedding strength once every --abs_pos_strength_decay_epochs; skews the training towards more time spent at lower guidance from the absolute embeddings, to avoid spending too much time on data dominated by values the model already knows. Does nothing if --convert_pos_embeddings is not set")
+    parser.add_argument("--abs_pos_strength_decay_epochs", type=float, default=0.05, help="When to apply --abs_pos_strength_decay, generally multiple times per epoch. Does nothing if --convert_pos_embeddings is not set")
+    parser.add_argument("--abs_pos_strength_threshold", type=float, default=0.01, help="Fixed lower limit for the absolute position strength, after which the value is dropped to zero and the model solely uses rotary embedding. Does nothing if --convert_pos_embeddings is not set")
 
     return parser.parse_args()
 
