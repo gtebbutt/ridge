@@ -6,9 +6,7 @@ import math
 import json
 import random
 import argparse
-import platform
 import functools
-import subprocess
 from typing import List, Dict, Tuple, Callable, Optional, Union, Any
 
 import torch
@@ -21,48 +19,13 @@ from accelerate.logging import get_logger
 from diffusers.schedulers import DDPMScheduler
 from einops._torch_specific import allow_ops_in_compiled_graph
 
+from ridge.utils import to_json, get_system_info
 from ridge.models.diffusion_transformer import DiffusionTransformerModel
 from ridge.data.datasets import EncodedTensorDataset
 from ridge.pipelines.default import RidgePipeline
 
 
 logger = get_logger(__name__, log_level="INFO")
-
-
-def to_json(obj):
-    # Output format matches diffusers ConfigMixin.to_json_file()
-    return f"{json.dumps(obj, indent=2, sort_keys=True)}\n"
-
-
-def get_commit_hash():
-    ch = None
-    try:
-        ch = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"]).decode("ascii").strip()
-    except Exception as e:
-        print(f"Couldn't get commit hash: {e}")
-    return ch
-
-
-def get_system_info():
-    gpus = [
-        {
-            "name": torch.cuda.get_device_properties(i).name,
-            "total_memory": torch.cuda.get_device_properties(i).total_memory,
-        }
-        for i in range(torch.cuda.device_count())
-    ]
-
-    return {
-        "python": {
-            "version": sys.version,
-            "hex": sys.hexversion,
-        },
-        "commit_hash": get_commit_hash(),
-        "gpu_info": gpus,
-        "platform_info": platform.uname()._asdict(),
-        "cuda_version": torch.version.cuda,
-        "cudnn_version": torch.backends.cudnn.version(),
-    }
 
 
 # During conversion the model will have both types of embedding enabled in the config, but that's unlikely to be useful when loading for inference later, so this modifies the json file to match what we'll actually want
