@@ -23,6 +23,8 @@ def main(args):
     rows = load_csv(args.input_csv_path, [args.id_column, args.text_column])
     output = []
 
+    os.makedirs(args.output_dir, exist_ok=True)
+
     for i, row in enumerate(rows):
         prompt = row[args.text_column]
         row_id = row[args.id_column]
@@ -61,7 +63,7 @@ def get_args():
     parser.add_argument("--input_csv_path", type=str, default="metadata.csv", help="Metadata csv containing the prompts to be encoded")
     parser.add_argument("--id_column", type=str, default="id", help="Column header containing the row IDs, to use for file naming")
     parser.add_argument("--text_column", type=str, default="text", help="Column header containing the input text to encode")
-    parser.add_argument("--output_csv_path", type=str, default="metadata-encoded.csv", help="Output path for csv with --prompt_embedding_column and --prompt_attention_mask_column added")
+    parser.add_argument("--output_csv_path", type=str, default="metadata-encoded.csv", help="Output path for csv with --text_embedding_column and --text_attention_mask_column added")
     parser.add_argument("--text_embedding_column", type=str, default="text_embedding_filename", help="Column header to write the filenames of the encoded prompts")
     parser.add_argument("--text_attention_mask_column", type=str, default="text_attention_mask_filename", help="Column header to write the filenames of the prompt attention masks")
     parser.add_argument("--output_dir", type=str, default="./preprocessed/text", help="Output folder for encoded tensors")

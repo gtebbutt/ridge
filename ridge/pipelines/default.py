@@ -3,6 +3,7 @@ from typing import List, Dict, Tuple, Callable, Optional, Union, Any
 
 import torch
 import torch.nn.functional as F
+from torchvision.transforms import v2 as transforms
 import torchvision.transforms.v2.functional as TF
 
 from diffusers import DiffusionPipeline, AutoencoderKL
@@ -13,10 +14,7 @@ from diffusers.pipelines.pixart_alpha.pipeline_pixart_alpha import retrieve_time
 from transformers import T5EncoderModel, T5Tokenizer
 
 from ..models.diffusion_transformer import DiffusionTransformerModel
-
-
-def round_to(x, base, fn=round):
-    return base * fn(x / base)
+from ..utils import round_to
 
 
 # Combines and simplifies the core functionality from diffusers versins of both DiTPipeline and PixartAlphaPipeline, and adds support for DiffusionTransformerModel's extra features

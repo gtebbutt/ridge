@@ -8,6 +8,10 @@ from typing import List
 import torch
 
 
+def round_to(x, base, fn=round):
+    return base * fn(x / base)
+
+
 def load_csv(
     csv_path: str,
     required_columns: List[str] = [],
