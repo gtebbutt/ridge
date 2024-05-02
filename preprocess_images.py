@@ -7,6 +7,7 @@ import torch
 import torchvision.transforms.v2.functional as TF
 
 from PIL import Image
+from tqdm import tqdm
 from diffusers import AutoencoderKL
 
 from ridge.utils import load_csv, round_to
@@ -162,41 +163,42 @@ def main(args):
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    for i, row in enumerate(rows):
+    for i, row in enumerate(tqdm(rows)):
         image_filename = row[args.image_filename_column]
         row_id = row[args.id_column]
-
         latent_filename = f"{row_id}_latent.pt"
-        with Image.open(os.path.join(args.image_dir, image_filename)) as im:
-            transformed = transform_image(
-                image=im,
-                max_pixel_count=args.max_pixel_count,
-                vae_scale_factor=vae_scale_factor,
-                patch_size=args.patch_size,
-                override_width=args.override_width,
-                override_height=args.override_height,
-                dtype=vae.dtype,
-            )
 
-        image_latent = encode_image(vae, transformed["image"])
+        try:
+            with Image.open(os.path.join(args.image_dir, image_filename)) as im:
+                transformed = transform_image(
+                    image=im,
+                    max_pixel_count=args.max_pixel_count,
+                    vae_scale_factor=vae_scale_factor,
+                    patch_size=args.patch_size,
+                    override_width=args.override_width,
+                    override_height=args.override_height,
+                    dtype=vae.dtype,
+                )
 
-        del transformed["image"]
-        row.update(transformed)
+            image_latent = encode_image(vae, transformed["image"])
 
-        # Important to clone the tensors when saving, otherwise torch will save the entire associated memory area rather than just the active view
-        torch.save(image_latent.detach().clone(), os.path.join(args.output_dir, latent_filename))
+            del transformed["image"]
+            row.update(transformed)
 
-        row[args.image_latent_column] = latent_filename
+            # Important to clone the tensors when saving, otherwise torch will save the entire associated memory area rather than just the active view
+            torch.save(image_latent.detach().clone(), os.path.join(args.output_dir, latent_filename))
 
-        output.append(row)
+            row[args.image_latent_column] = latent_filename
 
-        if i % args.save_interval == 0:
-            with open(args.output_csv_path, "w",  encoding="utf-8", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=output[0].keys())
-                writer.writeheader()
-                writer.writerows(output)
+            output.append(row)
 
-            print(f"Completed {i} / {len(rows)} rows")
+            if i % args.save_interval == 0:
+                with open(args.output_csv_path, "w",  encoding="utf-8", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=output[0].keys())
+                    writer.writeheader()
+                    writer.writerows(output)
+        except Exception as e:
+            print(f"Skipping image {image_filename}: {e}")
 
     print(f"Completed all rows")
 
