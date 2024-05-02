@@ -63,8 +63,7 @@ class DiffusionTransformerBlock(nn.Module):
                 heads=num_attention_heads,
                 dim_head=attention_head_dim,
                 bias=attention_bias,
-                use_rotary_pos_embed=use_rotary_pos_embed,
-                rotary_pos_embed_kwargs=rotary_pos_embed_kwargs,
+                use_rotary_pos_embed=False,
             )
         else:
             self.attn2 = None

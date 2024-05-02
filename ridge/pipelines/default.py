@@ -36,8 +36,12 @@ class RidgePipeline(DiffusionPipeline):
             transformer=transformer, vae=vae, scheduler=scheduler, tokenizer=tokenizer, text_encoder=text_encoder,
         )
 
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
-        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
+        if self.vae is not None:
+            self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+            self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
+
+        self.null_prompt_embed = None
+        self.null_prompt_attention_mask = None
 
     # Identical to the version used in the majority of diffusers pipelines, but it looks like it's not part of the base DiffusionPipeline class
     def prepare_latents(
@@ -151,10 +155,22 @@ class RidgePipeline(DiffusionPipeline):
 
         return prompt_embeds, prompt_attention_mask
 
+    # Ensures the values are only calculated once, and allows them to be set externally and/or used after unloading the text encoder from VRAM
+    def get_null_prompt_embed(
+        self,
+        prompt_max_sequence_length: int,
+        device: torch.device,
+    ):
+        if self.null_prompt_embed is None or self.null_prompt_attention_mask is None:
+            self.null_prompt_embed, self.null_prompt_attention_mask = self.encode_prompts("", prompt_max_sequence_length, device)
+        
+        return self.null_prompt_embed, self.null_prompt_attention_mask
+
     @staticmethod
     def prepare_prompt_embeds(
         prompt_embeds: torch.Tensor,
         prompt_attention_mask: torch.Tensor,
+        # null_prompt_embeds is plural because it can optionally be passed as a batch (although in that case it would generally be a batch containing the same embedding repeated multiple times)
         null_prompt_embeds: torch.Tensor,
         null_prompt_attention_mask: torch.Tensor,
         num_images_per_prompt: int,
@@ -200,7 +216,8 @@ class RidgePipeline(DiffusionPipeline):
     def __call__(
         self,
         *,
-        prompts: Optional[Union[str, List[str]]] = None,
+        # Prompts can be passed in as strings to encode, or already encoded as tuples of (embedding, attention_mask)
+        prompts: Optional[Union[str, List[str], List[Tuple[torch.tensor, torch.tensor]]]] = None,
         class_labels: Optional[Union[int, List[int]]] = None,
         num_inference_steps: int = 50,
         timesteps: List[int] = None,
@@ -240,6 +257,8 @@ class RidgePipeline(DiffusionPipeline):
         if len(sizes) != batch_size:
             raise ValueError(f"Expected number of image sizes ({len(sizes)}) to match number of class labels or prompts ({batch_size})")
 
+        # batch_size, class_labels, prompts, and sizes are deliberately not expanded to their final lengths at this point, since they will be duplicated by num_images_per_prompt further down
+
         # Ensure each image will map to an integer number of patches after VAE encoding and convolutional downsampling, rounding if necessary
         # Unlike aspect ratio binning, this is guaranteed to be within (patch_size * vae_scale_factor)/2 pixels of the requested size on each side - the 1 to 2% trim is pretty much imperceptible in normal use
         patch_size_pixels = self.vae_scale_factor * self.transformer.patch_size
@@ -266,22 +285,28 @@ class RidgePipeline(DiffusionPipeline):
 
         # Pad latents to match the largest size in the batch and return as a single tensor; will also be reshaped as part of the process, but that doesn't affect the inference loop
         latents, shapes_patches, attention_mask = self.transformer.flatten_and_pad(batch=latents)
-        attention_mask = torch.cat([attention_mask] * 2) if do_classifier_free_guidance else latents
+        attention_mask = torch.cat([attention_mask] * 2) if do_classifier_free_guidance else attention_mask
+        shapes_patches = shapes_patches * 2 if do_classifier_free_guidance else shapes_patches
 
         model_kwargs = {}
 
         if prompts is not None:
-            prompt_embeds, prompt_attention_mask = self.encode_prompts(prompts, prompt_max_sequence_length, device)
+            # If prompts is a list of tuples, they are pairs of pre-encoded (prompt_embed, prompt_attention_mask)
+            if isinstance(prompts[0], tuple):
+                prompt_embeds = torch.cat([r[0] for r in prompts])
+                prompt_attention_mask = torch.cat([r[1] for r in prompts])
+            else:
+                prompt_embeds, prompt_attention_mask = self.encode_prompts(prompts, prompt_max_sequence_length, device)
 
             if do_classifier_free_guidance:
-                null_prompt_embeds, null_prompt_attention_mask = self.encode_prompts("", prompt_max_sequence_length, device)
+                null_prompt_embed, null_prompt_attention_mask = self.get_null_prompt_embed(prompt_max_sequence_length, device)
             else:
-                null_prompt_embeds, null_prompt_attention_mask = (None, None)
+                null_prompt_embed, null_prompt_attention_mask = (None, None)
 
             prompt_embeds, prompt_attention_mask = self.prepare_prompt_embeds(
                 prompt_embeds=prompt_embeds,
                 prompt_attention_mask=prompt_attention_mask,
-                null_prompt_embeds=null_prompt_embeds,
+                null_prompt_embeds=null_prompt_embed,
                 null_prompt_attention_mask=null_prompt_attention_mask,
                 num_images_per_prompt=num_images_per_prompt,
                 do_classifier_free_guidance=do_classifier_free_guidance,
@@ -343,6 +368,7 @@ class RidgePipeline(DiffusionPipeline):
             output = latents
         else:
             # Unpack into a list of correctly shaped tensors and process separately
+            # If using cfg, shapes_patches will be twice as long as latents at this point (because latents has already been chunked) - the second half of shapes_patches will just be ignored
             latents = self.transformer.unpad_and_reshape(latents, shapes_patches)
 
             output = []

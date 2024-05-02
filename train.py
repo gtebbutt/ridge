@@ -1,5 +1,3 @@
-# Basic training script for initial proof of concept on classified inputs
-
 import os
 import sys
 import math
@@ -18,6 +16,7 @@ from accelerate.utils import ProjectConfiguration
 from accelerate.logging import get_logger
 from diffusers.schedulers import DDPMScheduler
 from einops._torch_specific import allow_ops_in_compiled_graph
+from slugify import slugify
 
 from ridge.utils import to_json, get_system_info
 from ridge.models.diffusion_transformer import DiffusionTransformerModel
@@ -78,22 +77,43 @@ def run_validation(
     base_model_path: str,
     accelerator: Accelerator,
     transformer: DiffusionTransformerModel,
+    encoded_prompts: Optional[Dict[str, Tuple[torch.tensor, torch.tensor]]] = None,
+    null_prompt_embed: Optional[torch.tensor] = None,
+    null_prompt_attention_mask: Optional[torch.tensor] = None,
+    class_labels: Optional[List[int]] = None,
     output_dir: str,
     output_suffix: str,
     seed: int,
     num_images_per_prompt: int,
     absolute_pos_embed_strength: float,
-    weight_dtype: torch.dtype,
     model_save_path: Optional[str] = None,
+    weight_dtype: torch.dtype,
 ):
     if accelerator.is_main_process:
         logger.info("Running validation...")
 
+        if class_labels is None and encoded_prompts is None:
+            raise ValueError(f"Must specify either class_labels or encoded_prompts for validation")
+
+        if class_labels is not None and (encoded_prompts is not None or null_prompt_embed is not None or null_prompt_attention_mask is not None):
+            raise ValueError(f"If class_labels is specified then encoded_prompts, null_prompt_embed, and null_prompt_attention_mask must all be None")
+
         pipe = RidgePipeline.from_pretrained(
             base_model_path,
             transformer=accelerator.unwrap_model(transformer),
+            tokenizer=None,
+            text_encoder=None,
             torch_dtype=weight_dtype,
         )
+
+        if class_labels:
+            pipeline_input = class_labels
+        else:
+            pipeline_input = encoded_prompts.items()
+
+            # These need to be manually set on the pipeline, otherwise the call function will try to access a text encoder that's explicitly disabled above
+            pipe.null_prompt_embed = null_prompt_embed.to(accelerator.device)
+            pipe.null_prompt_attention_mask = null_prompt_attention_mask.to(accelerator.device)
 
         # Currently only used on the final validation, after training is complete, to save a final copy of everything in one place
         if model_save_path is not None:
@@ -110,10 +130,7 @@ def run_validation(
         if absolute_pos_embed_strength != 1.0:
             save_conversion_state(validation_folder, absolute_pos_embed_strength)
 
-        # Nothing inherently special about this choice of labels, it just matches the ones used in the original facebookresearch/DiT repo for easier comparison
-        class_labels = [207, 360, 387, 974, 88, 979, 417, 279]
-
-        # These are also more or less arbitrary, as a decent range of shapes and sizes to test the boundaries of a nominally 256x256 model
+        # These are more or less arbitrary, just a decent range of shapes and sizes to test the boundaries of a nominally 256x256 model
         sizes = [
             (256, 256),
             (384, 384),
@@ -123,24 +140,34 @@ def run_validation(
             (1024, 64),
         ]
 
-        # Runs every size and label separately, rather than needing to keep track of what does/doesn't work with any given transformer config
+        # Runs every size and label or prompt separately, rather than needing to keep track of what does/doesn't work with any given transformer config
         for size in sizes:
-            for label in class_labels:
+            for item in pipeline_input:
                 generator = torch.Generator(device=accelerator.device).manual_seed(seed)
+
+                if class_labels:
+                    filename_suffix = item
+                    pipeline_kwargs = {"class_labels": [item]}
+                else:
+                    # encoded_prompts will be a dict of `prompt_text: (prompt_embed, prompt_attention_mask)`
+                    filename_suffix = slugify(item[0], max_length=64)
+                    pipeline_kwargs = {"prompts": [
+                        (item[1][0].to(accelerator.device), item[1][1].to(accelerator.device))
+                    ]}
 
                 # Enabling autocast when in fp32 mode can cause VAE issues
                 with torch.cuda.amp.autocast(enabled=(weight_dtype != torch.float32)):
                     images = pipe(
-                        class_labels=[label],
                         sizes=[size],
                         generator=generator,
                         num_images_per_prompt=num_images_per_prompt,
                         absolute_pos_embed_strength=absolute_pos_embed_strength,
+                        **pipeline_kwargs
                     )[0]
-                
+
                 h, w = size
                 for i, image in enumerate(images):
-                    image.save(os.path.join(validation_folder, f"sample-{w}x{h}-{label}-{i}.png"))
+                    image.save(os.path.join(validation_folder, f"sample-{w}x{h}-{filename_suffix}-{i}.png"))
 
 
 def training_loop(
@@ -151,6 +178,7 @@ def training_loop(
     noise_scheduler: DDPMScheduler,
     optimizer: torch.optim.AdamW,
     dataloader: torch.utils.data.DataLoader,
+    validation_kwargs: dict,
 ):
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
@@ -187,6 +215,7 @@ def training_loop(
                     num_images_per_prompt=args.validation_images_per_prompt,
                     absolute_pos_embed_strength=absolute_pos_embed_strength,
                     weight_dtype=weight_dtype,
+                    **validation_kwargs
                 )
 
             if args.convert_pos_embeddings and absolute_pos_embed_strength > 0 and global_step % int(args.abs_pos_strength_decay_epochs * steps_per_epoch) == 0:
@@ -208,8 +237,11 @@ def training_loop(
             if batch.get("class_labels") is not None:
                 model_kwargs["class_labels"] = batch["class_labels"].to(device=accelerator.device, dtype=torch.int)
             else:
-                model_kwargs["prompt_embeds"] = batch["prompt_embeds"].to(device=accelerator.device, dtype=weight_dtype)
-                model_kwargs["prompt_attention_mask"] = batch["prompt_attention_mask"].to(device=accelerator.device, dtype=weight_dtype)
+                model_kwargs["encoder_hidden_states"] = batch["prompt_embeds"].to(device=accelerator.device, dtype=weight_dtype)
+                model_kwargs["encoder_attention_mask"] = batch["prompt_attention_mask"].to(device=accelerator.device, dtype=weight_dtype)
+
+                # Resolution and aspect_ratio args are requried by PixArtAlphaCombinedTimestepSizeEmbeddings, even if they're set to None
+                model_kwargs["added_cond_kwargs"] = {"resolution": None, "aspect_ratio": None}
 
             # Since we're creating duplicate tensors here, it's done on the same device as the model_input from the batch (should always be the CPU, given how the dataloader is set up) and only the parts being passed to the model are moved to the GPU
             model_input = batch["model_input"]
@@ -282,34 +314,95 @@ def training_loop(
             weight_dtype=weight_dtype,
             # Saves the full pipeline state to `args.output_dir/final` before validating
             model_save_path="final",
+            **validation_kwargs
         )
 
     accelerator.end_training()
 
 
-def collate_fn(examples, proportion_null_inputs):
+def collate_fn(
+    examples: dict,
+    *,
+    proportion_null_inputs: float,
+    has_text_encoder: bool,
+    null_prompt_embed: Optional[torch.tensor] = None,
+    null_prompt_attention_mask: Optional[torch.tensor] = None,
+):
     if len(examples) == 0:
         # Allows the training loop to cleanly recognise and skip batch loading errors
         return {}
     
     # VAE input already has a batch axis, so using torch.cat rather than torch.stack
-    model_input = torch.cat([example["model_input"] for example in examples])
-    class_labels = torch.cat([
-        torch.tensor([int(example["metadata"]["label"])])
-        if random.random() > proportion_null_inputs else
-        torch.tensor([1000]) # Null label to allow for cfg in the trained model - imagenet classes run 0-999, with 1000 defined as null
-        for example in examples
-    ])
+    output = {"model_input": torch.cat([example["model_input"] for example in examples])}
 
-    return {
-        "model_input": model_input,
-        "class_labels": class_labels,
-    }
+    if has_text_encoder:
+        output["prompt_embeds"] = []
+        output["prompt_attention_mask"] = []
+
+        for i in range(len(examples)):
+            if random.random() > proportion_null_inputs:
+                # Collating a list with column header prompt_embed (singular) into a single tensor containing multiple prompt embeds (plural)
+                output["prompt_embeds"].append(examples[i]["prompt_embed"])
+                # Attention mask is singular, since it's one N-dimensional mask constructed to apply across many embeddings
+                output["prompt_attention_mask"].append(examples[i]["prompt_attention_mask"])
+            else:
+                output["prompt_embeds"].append(null_prompt_embed)
+                output["prompt_attention_mask"].append(null_prompt_attention_mask)
+
+        output["prompt_embeds"] = torch.cat(output["prompt_embeds"])
+        output["prompt_attention_mask"] = torch.cat(output["prompt_attention_mask"])
+    else:
+        output["class_labels"] = torch.cat([
+            torch.tensor([int(example["metadata"]["label"])])
+            if random.random() > proportion_null_inputs else
+            # Null label to allow for cfg in the trained model - imagenet classes run 0-999, with 1000 defined as null
+            torch.tensor([1000])
+            for example in examples
+        ])
+
+    return output
+
+
+@torch.no_grad()
+def encode_text(
+    *,
+    base_model_path: str,
+    accelerator: Accelerator,
+    strings: List[str],
+    dtype: torch.dtype = torch.float16,
+    prompt_max_sequence_length: int = 120,
+):
+    pipe = RidgePipeline.from_pretrained(
+        base_model_path,
+        transformer=None,
+        scheduler=None,
+        vae=None,
+        torch_dtype=dtype,
+    )
+
+    pipe.to(accelerator.device)
+
+    output = {}
+
+    for s in strings:
+        embed, attention_mask = pipe.encode_prompts(s, prompt_max_sequence_length, accelerator.device)
+
+        # Ensure the tensors being returned don't hold any hanging references to anything in the pipeline - the no_grad decorator should make this unnecessary, but no harm in being safe
+        # Return as CPU tensors so they're not sitting unused in VRAM the whole time
+        embed = embed.detach().clone().to("cpu")
+        attention_mask = attention_mask.detach().clone().to("cpu")
+        output[s] = (embed, attention_mask)
+    
+    return output
 
 
 def main(args):
     # Prevent einops from causing unncessary graph breaks
     allow_ops_in_compiled_graph()
+
+    with open(os.path.join(args.base_model_path, "model_index.json")) as f:
+        # Defines whether this is a classified (DiT style) or freeform (PixArt style) model
+        has_text_encoder = bool(json.load(f).get("text_encoder"))
 
     accelerator = Accelerator(
         gradient_accumulation_steps=1,
@@ -331,6 +424,20 @@ def main(args):
         subfolder="scheduler",
         variance_type=args.variance_type
     )
+
+    # Encode validation prompts before loading the transformer, to avoid repeatedly swapping large text encoder models in and out of VRAM
+    if has_text_encoder:
+        validation_prompts = ["an astronaut riding a horse"]
+
+        # Process null prompt as part of the same call, rather than loading and unloading the text encoder twice
+        validation_prompts.append("")
+
+        validation_prompts = encode_text(
+            base_model_path=args.base_model_path,
+            accelerator=accelerator,
+            strings=validation_prompts,
+        )
+        null_prompt_embed, null_prompt_attention_mask = validation_prompts.pop("")
 
     transformer_base_path = args.base_model_path if args.transformer_path is None else args.transformer_path
 
@@ -375,25 +482,54 @@ def main(args):
         weight_decay=args.adam_weight_decay,
     )
 
+    columns_to_load = {args.image_latent_column: {"dir": args.image_latent_dir, "rename_to": "model_input"}}
+
+    if has_text_encoder:
+        columns_to_load[args.prompt_embedding_column] = {"dir": args.prompt_embedding_dir, "rename_to": "prompt_embed"}
+        columns_to_load[args.prompt_attention_mask_column] = {"dir": args.prompt_embedding_dir, "rename_to": "prompt_attention_mask"}
+
     dataset = EncodedTensorDataset(
         csv_path=args.csv_path,
-        columns_to_load={
-            args.image_latent_column: {"dir": args.image_latent_dir, "rename_to": "model_input"}
-        },
+        columns_to_load=columns_to_load,
         use_class_labels=True,
     )
+
+    if has_text_encoder:
+        collate_fn_partial = functools.partial(
+            collate_fn,
+            proportion_null_inputs=args.proportion_null_inputs,
+            has_text_encoder=has_text_encoder,
+            null_prompt_embed=null_prompt_embed,
+            null_prompt_attention_mask=null_prompt_attention_mask,
+        )
+    else:
+        collate_fn_partial = functools.partial(
+            collate_fn,
+            proportion_null_inputs=args.proportion_null_inputs,
+            has_text_encoder=has_text_encoder,
+        )
 
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=functools.partial(collate_fn, proportion_null_inputs=args.proportion_null_inputs),
+        collate_fn=collate_fn_partial,
         num_workers=args.dataloader_num_workers,
         prefetch_factor=args.dataloader_prefetch_factor,
     )
 
     # Can be passed in any order, the prepared objects are just returned in input order
     diffusion_transformer, optimizer, dataloader = accelerator.prepare(diffusion_transformer, optimizer, dataloader)
+
+    if has_text_encoder:
+        validation_kwargs = {
+            "encoded_prompts": validation_prompts,
+            "null_prompt_embed": null_prompt_embed,
+            "null_prompt_attention_mask": null_prompt_attention_mask,
+        }
+    else:
+        # Nothing inherently special about this choice of labels, it just matches the ones used in the original facebookresearch/DiT repo for easier comparison
+        validation_kwargs = {"class_labels": [207, 360, 387, 974, 88, 979, 417, 279]}
 
     training_loop(
         args=args,
@@ -402,6 +538,7 @@ def main(args):
         noise_scheduler=noise_scheduler,
         optimizer=optimizer,
         dataloader=dataloader,
+        validation_kwargs=validation_kwargs,
     )
 
 
@@ -415,8 +552,11 @@ def get_args():
     parser.add_argument("--transformer_path", type=str, default=None, help="Optional path to main transformer config and weights, to use instead of the transformer from --base_model_path")
     parser.add_argument("--train_from_scratch", action="store_true", help="Load main transformer config only (from either --base_model_path or --transformer_path if present) without loading pretrained weights")
     parser.add_argument("--csv_path", type=str, default="metadata.csv", help="Metadata csv for the dataloader")
-    parser.add_argument("--image_latent_column", type=str, default="image_latent_filename", help="Column header containing the filenames for the VAE encoded image latents")
     parser.add_argument("--image_latent_dir", type=str, default="./preprocessed/vae", help="Folder path for VAE latents, if not already included in filenames column")
+    parser.add_argument("--image_latent_column", type=str, default="image_latent_filename", help="Column header containing the filenames for the VAE encoded image latents")
+    parser.add_argument("--prompt_embedding_dir", type=str, default="./preprocessed/text", help="Folder path for text embeddings, if not already included in filenames column")
+    parser.add_argument("--prompt_embedding_column", type=str, default="text_embedding_filename", help="Column header containing the filenames for the encoded prompts")
+    parser.add_argument("--prompt_attention_mask_column", type=str, default="text_attention_mask_filename", help="Column header containing the filenames for the prompt attention masks")
     parser.add_argument("--seed", type=int, default=42, help="Currently only used during validation")
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=32)
