@@ -4,6 +4,8 @@ import argparse
 
 import torch
 
+from tqdm import tqdm
+
 from ridge.utils import load_csv
 from ridge.pipelines.default import RidgePipeline
 
@@ -25,7 +27,7 @@ def main(args):
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    for i, row in enumerate(rows):
+    for i, row in enumerate(tqdm(rows)):
         prompt = row[args.text_column]
         row_id = row[args.id_column]
         embed, attention_mask = pipe.encode_prompts(prompt, args.prompt_max_sequence_length, args.device)
@@ -42,13 +44,11 @@ def main(args):
 
         output.append(row)
 
-        if i % args.save_interval == 0:
+        if i % args.save_interval == 0 or i + 1 == len(rows):
             with open(args.output_csv_path, "w",  encoding="utf-8", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=output[0].keys())
                 writer.writeheader()
                 writer.writerows(output)
-
-            print(f"Completed {i} / {len(rows)} rows")
 
     print(f"Completed all rows")
 
@@ -67,7 +67,7 @@ def get_args():
     parser.add_argument("--text_embedding_column", type=str, default="text_embedding_filename", help="Column header to write the filenames of the encoded prompts")
     parser.add_argument("--text_attention_mask_column", type=str, default="text_attention_mask_filename", help="Column header to write the filenames of the prompt attention masks")
     parser.add_argument("--output_dir", type=str, default="./preprocessed/text", help="Output folder for encoded tensors")
-    parser.add_argument("--save_interval", type=int, default=100, help="Update the output CSV after processing every N rows, for partial output even if the script is stopped before completing")
+    parser.add_argument("--save_interval", type=int, default=50000, help="Update the output CSV after processing every N rows, for partial output even if the script is stopped before completing")
     parser.add_argument("--prompt_max_sequence_length", type=int, default=120, help="Maximum (token) sequence length to use when encoding - defines padding used for output tensors")
     parser.add_argument("--device", type=str, default="cuda", help="Torch device to use")
 

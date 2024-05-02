@@ -192,7 +192,7 @@ def main(args):
 
             output.append(row)
 
-            if i % args.save_interval == 0:
+            if i % args.save_interval == 0 or i + 1 == len(rows):
                 with open(args.output_csv_path, "w",  encoding="utf-8", newline="") as f:
                     writer = csv.DictWriter(f, fieldnames=output[0].keys())
                     writer.writeheader()
@@ -218,7 +218,7 @@ def get_args():
     parser.add_argument("--output_csv_path", type=str, default="metadata-latents.csv", help="Output path for csv with --image_latent_column and image metadata added")
     parser.add_argument("--image_latent_column", type=str, default="image_latent_filename", help="Column header to write the filenames of the image latents")
     parser.add_argument("--output_dir", type=str, default="./preprocessed/vae", help="Output folder for encoded tensors")
-    parser.add_argument("--save_interval", type=int, default=100, help="Update the output CSV after processing every N rows, for partial output even if the script is stopped before completing")
+    parser.add_argument("--save_interval", type=int, default=50000, help="Update the output CSV after processing every N rows, for partial output even if the script is stopped before completing")
     parser.add_argument("--patch_size", type=int, default=2, help="Patch size in latent space (can be found in transformer/config.json)")
     parser.add_argument("--device", type=str, default="cuda", help="Torch device to use")
 
