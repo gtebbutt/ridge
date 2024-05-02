@@ -2,6 +2,7 @@ import os
 import sys
 import math
 import json
+import shutil
 import random
 import argparse
 import functools
@@ -412,12 +413,13 @@ def main(args):
         project_config=ProjectConfiguration(project_dir=args.output_dir, logging_dir=os.path.join(args.output_dir, "logs")),
     )
 
+    # Save training info for later reference
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "args.json"), "w", encoding="utf-8") as f:
         f.write(to_json(vars(args)))
-
     with open(os.path.join(args.output_dir, "system_info.json"), "w", encoding="utf-8") as f:
         f.write(to_json(get_system_info()))
+    shutil.copy(args.csv_path, os.path.join(args.output_dir, "metadata.csv"))
 
     noise_scheduler = DDPMScheduler.from_pretrained(
         args.base_model_path,
