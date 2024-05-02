@@ -31,6 +31,10 @@ def transform_image(
     if not isinstance(image, Image.Image):
         raise ValueError(f"Expected PIL image, but got {type(image)}")
 
+    # Pillow can always safely convert 8-bit greyscale to 24-bit RGB, but that isn't true of every mode
+    if image.mode == "L":
+        image = image.convert(mode="RGB")
+
     if not image.mode == "RGB":
         raise ValueError(f"Expected three channel RGB input, but got {image.mode}")
 
