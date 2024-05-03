@@ -244,8 +244,13 @@ def training_loop(
                 # Resolution and aspect_ratio args are requried by PixArtAlphaCombinedTimestepSizeEmbeddings, even if they're set to None
                 model_kwargs["added_cond_kwargs"] = {"resolution": None, "aspect_ratio": None}
 
-            # Since we're creating duplicate tensors here, it's done on the same device as the model_input from the batch (should always be the CPU, given how the dataloader is set up) and only the parts being passed to the model are moved to the GPU
+            # Model input has already been reshaped into a linear sequence of patches by the flatten_and_pad call in collate_fn, with shape (b c h*w/p p) where h, w, and p are in latent space, and this will then be converted to a sequence of single values (b n c) by the patch_embed call at the start of the model 
+            # It's reshaped like this outside the model for easier reasoning when padding across batches in multiple dimensions, but can't be returned in (b n c) form here because that requires a learned convolution operation within the model
             model_input = batch["model_input"]
+            shapes_patches = batch["shapes_patches"]
+            attention_mask = batch["attention_mask"]
+
+            # Since we're creating duplicate tensors for the noise and the timestep, it's done on the same device as the model_input from the batch (should always be the CPU, given how the dataloader is set up) and only the parts being passed to the model are moved to the GPU
             noise = torch.randn_like(model_input)
             timestep = torch.randint(0, noise_scheduler.config.num_train_timesteps, (model_input.shape[0],), device=model_input.device)
             timestep = timestep.long()
@@ -254,7 +259,6 @@ def training_loop(
             timestep = timestep.expand(noisy_model_input.shape[0]).to(device=accelerator.device)
             noisy_model_input.to(device=accelerator.device, dtype=weight_dtype)
 
-            noisy_model_input, shapes_patches, attention_mask = model.flatten_and_pad(batch=[l.unsqueeze(0) for l in noisy_model_input])
 
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
@@ -272,9 +276,17 @@ def training_loop(
                 if model.config.out_channels // 2 == model.config.in_channels:
                     noise_pred = noise_pred.chunk(2, dim=1)[0]
 
-                # NB: This currently only supports homogeneous batches, making padding/unpadding largely redundant - 
-                noise_pred = torch.cat(model.unpad_and_reshape(noise_pred, shapes_patches), dim=0)
-                loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+                # Important to disable reduction and return the raw tensor so that masked patches can be ignored when calculating the loss
+                loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="none")
+
+                # The attention mask has one value per patch (and no channels axis), because it's expected to be used by the model after the patch_embed call, but we're applying it to the loss tensor which is in latent space patches rather than single value patches
+                # Repeat each mask value in place along the patch sequence axis
+                attention_mask = attention_mask.repeat_interleave(model.patch_size, dim=1)
+                # Add singleton axes for channels and patch width, since the masking will be identical along both of these dimensions
+                attention_mask = attention_mask.unsqueeze(1).unsqueeze(3)
+
+                # Since the attention mask is defined as 1 for active, 0 for masked, it can be applied to the loss tensor with a simple elementwise multiplication before summing. Important for the denominator to be the total number of unmasked patches only (i.e. the sum of 1s in the mask, not the number of elements), with explicit scalar multiplication to account for the singleton channel and patch width axes which are implicitly handled when multiplying tensors in the numerator
+                loss = (loss * attention_mask).sum() / (attention_mask.sum() * loss.shape[1] * loss.shape[3])
 
                 accelerator.backward(loss)
 
@@ -324,6 +336,7 @@ def training_loop(
 def collate_fn(
     examples: dict,
     *,
+    model: DiffusionTransformerModel,
     proportion_null_inputs: float,
     has_text_encoder: bool,
     null_prompt_embed: Optional[torch.tensor] = None,
@@ -332,9 +345,16 @@ def collate_fn(
     if len(examples) == 0:
         # Allows the training loop to cleanly recognise and skip batch loading errors
         return {}
-    
-    # VAE input already has a batch axis, so using torch.cat rather than torch.stack
-    output = {"model_input": torch.cat([example["model_input"] for example in examples])}
+
+    # Pads to a common patch sequence length, allowing inputs of unequal size to be collated
+    model_input, shapes_patches, attention_mask = model.flatten_and_pad(batch=[example["model_input"] for example in examples])
+
+    output = {
+        "model_input": model_input,
+        "shapes_patches": shapes_patches,
+        # This is the mask for the image patch padding, and is unrelated to prompt_attention_mask or null_prompt_attention_mask, which apply to the text embeddings
+        "attention_mask": attention_mask,
+    }
 
     if has_text_encoder:
         output["prompt_embeds"] = []
@@ -499,6 +519,7 @@ def main(args):
     if has_text_encoder:
         collate_fn_partial = functools.partial(
             collate_fn,
+            model=diffusion_transformer,
             proportion_null_inputs=args.proportion_null_inputs,
             has_text_encoder=has_text_encoder,
             null_prompt_embed=null_prompt_embed,
@@ -507,6 +528,7 @@ def main(args):
     else:
         collate_fn_partial = functools.partial(
             collate_fn,
+            model=diffusion_transformer,
             proportion_null_inputs=args.proportion_null_inputs,
             has_text_encoder=has_text_encoder,
         )
