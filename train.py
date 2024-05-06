@@ -85,6 +85,7 @@ def run_validation(
     output_dir: str,
     output_suffix: str,
     seed: int,
+    sizes: List[Tuple[int, int]],
     num_images_per_prompt: int,
     absolute_pos_embed_strength: float,
     model_save_path: Optional[str] = None,
@@ -130,16 +131,6 @@ def run_validation(
 
         if absolute_pos_embed_strength != 1.0:
             save_conversion_state(validation_folder, absolute_pos_embed_strength)
-
-        # These are more or less arbitrary, just a decent range of shapes and sizes to test the boundaries of a nominally 256x256 model
-        sizes = [
-            (256, 256),
-            (384, 384),
-            (512, 512),
-            (192, 336),
-            (128, 512),
-            (1024, 64),
-        ]
 
         # Runs every size and label or prompt separately, rather than needing to keep track of what does/doesn't work with any given transformer config
         for size in sizes:
@@ -555,6 +546,18 @@ def main(args):
         # Nothing inherently special about this choice of labels, it just matches the ones used in the original facebookresearch/DiT repo for easier comparison
         validation_kwargs = {"class_labels": [207, 360, 387, 974, 88, 979, 417, 279]}
 
+    # These are more or less arbitrary, just a decent range of scales and ratios to test the boundaries of a nominally square model; (h w) order
+    validation_size_scale_factors = [
+        (1, 1),
+        (1.5, 1.5),
+        (2, 2),
+        (0.5, 0.5),
+        (0.75, 1.3125),
+        (0.5, 2),
+        (4, 0.25),
+    ]
+    validation_kwargs["sizes"] = [(int(args.validation_base_size * s[0]), int(args.validation_base_size * s[1])) for s in validation_size_scale_factors]
+
     training_loop(
         args=args,
         accelerator=accelerator,
@@ -591,6 +594,7 @@ def get_args():
     parser.add_argument("--checkpointing_epochs", type=float, default=0.2)
     parser.add_argument("--validation_epochs", type=float, default=0.2)
     parser.add_argument("--validation_images_per_prompt", type=int, default=2)
+    parser.add_argument("--validation_base_size", type=int, default=1024, help="Nominal edge length of the model, assuming square output. Will be used as a basis for a range of output sizes and ratios")
     parser.add_argument("--output_dir", type=str, default="train-out")
     parser.add_argument("--mixed_precision", type=str, default="bf16")
     parser.add_argument("--dynamo_backend", type=str, default="inductor")
